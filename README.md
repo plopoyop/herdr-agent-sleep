@@ -27,6 +27,8 @@ what is needed to resume them.
   their rows, so Sleeping sits right under the agents and the spare height
   goes to Spaces.
 - Click **after 5m** in the list header to change the delay: 5, 10, 20, 60 min, or off.
+- Click **by space** in the list header to change the order: by space,
+  longest asleep first, or newest asleep first.
 
 An agent is left awake when:
 
@@ -116,7 +118,7 @@ shows sample rows and does nothing (used for `preview.png`).
 Quit the Herdr app first: your terminals keep running (herdr-core), and no
 copy of the mod runs while its settings are removed. The script removes the
 labels it left on terminals (finished ones included), its block from every
-layout, its shared settings (delay) and the mod. Agents asleep at that moment
+layout, its shared settings (delay, order) and the mod. Agents asleep at that moment
 stay on their shell: their resume commands, with the folder to run them in,
 are printed and saved in
 `~/.config/herdr-app/.agent-sleep-backup/<date>/sleeping.txt` before any

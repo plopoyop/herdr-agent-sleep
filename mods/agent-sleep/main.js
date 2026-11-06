@@ -64,6 +64,16 @@ const PRESENCE_EVERY_MS = 15_000;
 const LEADER_STALE_MS = 3 * PRESENCE_EVERY_MS;
 const VISIBLE_KEY = "agent-sleep.visible";
 const DELAY_KEY = "agent-sleep.delay";
+// Order of the Sleeping list, shared like the delay: by space (the order
+// Herdr keeps the terminals in), longest asleep first, or newest first.
+const SORT_KEY = "agent-sleep.sort";
+const SORTS = ["space", "longest", "newest"];
+const SORT_LABEL = { space: "by space", longest: "longest", newest: "newest" };
+const SORT_TIP = {
+  space: "Sorted by space (click to change)",
+  longest: "Longest asleep first (click to change)",
+  newest: "Newest asleep first (click to change)",
+};
 
 // Fit (block props `fit: true`): the Agents block and this one take the
 // height of their rows, so the Sleeping list sits right under the agents and
@@ -125,6 +135,19 @@ const delay = () => {
   const d = shared(DELAY_KEY);
   return DELAYS.includes(d) ? d : DEFAULT_DELAY;
 };
+
+const sortMode = () => {
+  const s = shared(SORT_KEY);
+  return SORTS.includes(s) ? s : "space";
+};
+
+// Rows without a sleep time yet (falling asleep) count as asleep since now.
+function sortRows(list, mode, now) {
+  if (mode === "space") return list;
+  const since = (s) => Number(s.labels[L.since]) || now;
+  const dir = mode === "longest" ? 1 : -1;
+  return [...list].sort((a, b) => dir * (since(a) - since(b)));
+}
 
 function duration(ms) {
   const m = Math.floor(ms / 60000);
@@ -612,6 +635,10 @@ export default class AgentSleep extends View {
     }
   }
 
+  cycleSort() {
+    setShared(SORT_KEY, SORTS[(SORTS.indexOf(sortMode()) + 1) % SORTS.length]);
+  }
+
   cycleDelay() {
     setShared(DELAY_KEY, DELAYS[(DELAYS.indexOf(delay()) + 1) % DELAYS.length]);
   }
@@ -651,8 +678,9 @@ export default class AgentSleep extends View {
 
   render(cx) {
     const t = theme();
-    const list = this.sleeping();
     const now = Date.now();
+    const sort = sortMode();
+    const list = sortRows(this.sleeping(), sort, now);
     if (!isDemo()) {
       this.presence();
       this.markSeen(list, cx);
@@ -680,6 +708,11 @@ export default class AgentSleep extends View {
             .child("Sleeping"))
           .child(div().text_color(t.dim).child(String(list.length)))
           .child(div().flex_1())
+          .child(div().id("sleep-sort").px(5).rounded(4).cursor_pointer().text_color(t.dim)
+            .hover((s) => s.bg(t.hover).text_color(t.foreground))
+            .tooltip(SORT_TIP[sort])
+            .on_click(() => this.cycleSort())
+            .child(SORT_LABEL[sort]))
           .child(div().id("sleep-delay").px(5).rounded(4).cursor_pointer().text_color(t.dim)
             .hover((s) => s.bg(t.hover).text_color(t.foreground))
             .tooltip("Sleep idle agents after… (click to change)")

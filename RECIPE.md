@@ -11,7 +11,8 @@ resumes it with its whole conversation.
 - A block under the `agents` block of the sidebar, weight 0.5 next to its
   weight 1, background `chrome`, text 13 px.
 - Header, 30 px high, 16 px side padding, text 11 px medium `dim`:
-  "Sleeping", the count, and on the right a chip "after 5m" (or "off").
+  "Sleeping", the count, and on the right two chips: the order ("by space",
+  "longest" or "newest") and the delay ("after 5m", or "off").
 - One row per sleeping agent, 30 px high, radius 8, hover `hover`: the
   agent's icon (`icons/claude.svg`, `icons/codex.svg`) at 45 % opacity, the
   space name in `muted` (max 120 px), "· title" in `dim`, the time asleep
@@ -87,7 +88,11 @@ resumes it with its whole conversation.
   labels as soon as the agent runs with that session. A waking row whose
   terminal is back in `agents()` (a sleeping one, on its shell, isn't) is
   hidden at once.
-- Click the header chip: delay cycles 5 → 10 → 20 → 60 → off (shared key
+- Click the order chip: by space (Herdr's terminal order) → longest asleep
+  first → newest asleep first (shared key `agent-sleep.sort`, so every copy
+  agrees). A row falling asleep, with no sleep time yet, counts as asleep
+  since now.
+- Click the delay chip: delay cycles 5 → 10 → 20 → 60 → off (shared key
   `agent-sleep.delay`, so every copy agrees).
 - Click "Sleeping": fold or unfold the list.
 - `close()` drops this copy's entry and stale ones from `agent-sleep.visible`
