@@ -7,8 +7,9 @@
 // Clicking it types the agent's resume command in that shell.
 //
 // Left awake: agents shown in the window (focused, or any pane of the tab on
-// screen), pinned agents, agents with text in their prompt, agents not
-// started from a shell, agents on other machines.
+// screen), agents shown in another machine's app (agent-sleep.viewed), pinned
+// agents, agents with text in their prompt, agents not started from a shell,
+// agents on other machines (their machine's copy handles them).
 //
 // State lives on the terminal as labels (visible with `hc get`), so it
 // survives app restarts and every copy of this mod agrees:
@@ -19,6 +20,7 @@
 //   agent-sleep.prompt=<the shell's last line once asleep>
 //   agent-sleep.cwd=<the agent's folder>  (for uninstall.sh's saved commands)
 //   agent-sleep.waker=<copy id>  (which copy types the resume command)
+//   agent-sleep.viewed=<ms>      (shown in another machine's app, written by it)
 //
 // Nothing is typed into a sleeping terminal's shell unless its last line is
 // still exactly what it was when the agent fell asleep: text the person typed
@@ -26,7 +28,7 @@
 
 import { View, div, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { agents, terminals, panes, spaces, focused, theme, run, hc, shared, setShared, notify, layout, props } from "herdr";
+import { agents, terminals, panes, spaces, machines, focused, theme, run, hc, shared, setShared, notify, layout, props } from "herdr";
 import { adapterFor, adapterById, isSessionId } from "./adapters.js";
 
 const LABEL = "agent-sleep";
@@ -63,6 +65,15 @@ const LEADER_KEY = "agent-sleep.leader";
 const PRESENCE_EVERY_MS = 15_000;
 const LEADER_STALE_MS = 3 * PRESENCE_EVERY_MS;
 const VISIBLE_KEY = "agent-sleep.visible";
+// Shared keys stay inside one app: a copy that shows a terminal of another
+// machine writes the time on that terminal instead, and that machine's copy
+// leaves it awake. A label is rewritten every PRESENCE_EVERY_MS, so it can be
+// that old when read: on top of that, clocks may be up to 90 s apart.
+const VIEWED = `${LABEL}.viewed`;
+const VIEWED_STALE_MS = PRESENCE_EVERY_MS + 90_000;
+// A label task on another machine that hasn't finished after this long (an
+// unreachable machine) no longer blocks the next one.
+const REFRESH_STUCK_MS = 60_000;
 const DELAY_KEY = "agent-sleep.delay";
 // Order of the Sleeping list, shared like the delay: by space (the order
 // Herdr keeps the terminals in), longest asleep first, or newest first.
@@ -177,6 +188,15 @@ async function lastLine(address) {
 }
 
 const local = (address) => !String(address).includes("/");
+// `vps/t7` → "vps"; null for this machine.
+const machineOf = (address) => (local(address) ? null : String(address).split("/")[0]);
+// Other machines this app reaches now (`machines()`: offline ones aren't ready).
+const readyMachines = () => new Set(machines().filter((m) => m.name && m.layout === "ready").map((m) => m.name));
+// Shown lately in a window of another machine's app (both ways: clocks differ).
+const viewedElsewhere = (t) => {
+  const at = Number(t?.labels?.[VIEWED]);
+  return at > 0 && Math.abs(Date.now() - at) < VIEWED_STALE_MS;
+};
 // A login shell's argv[0] starts with "-" ("-bash", "-zsh").
 const basename = (p) => String(p ?? "").split("/").pop().replace(/^-/, "");
 const onShell = (t) => SHELLS.has(basename(t?.foreground?.name));
@@ -227,16 +247,20 @@ export default class AgentSleep extends View {
     this.folded = false;
     this.seeing = new Set(); // unseen marks being cleared
     this.waking = new Set(); // rows clicked, shown as waking before any label is written
+    this.viewed = new Map(); // other machines' terminals shown here → last VIEWED write
+    this.viewedKey = null; // other machines' terminals shown here, last synced
+    this.labelling = new Map(); // address → its label task under way ({ at })
+    this.failedView = new Map(); // address → when writing its VIEWED label last failed
     if (isDemo()) return;
     cx.timer.every(CHECK_EVERY_MS, (cx) => this.tick(cx));
-    cx.timer.every(PRESENCE_EVERY_MS, () => this.presence(true));
-    this.presence(true);
+    cx.timer.every(PRESENCE_EVERY_MS, (cx) => this.presence(true, cx));
+    this.presence(true, cx);
     this.tick(cx);
   }
 
   // Announce what this window shows (on change, and every PRESENCE_EVERY_MS
   // so it doesn't go stale), drop stale entries, and keep the lead alive.
-  presence(periodic = false) {
+  presence(periodic = false, cx = null) {
     const terms = [...shownHere()].sort();
     const all = shared(VISIBLE_KEY) ?? {};
     const mine = all[this.id];
@@ -247,18 +271,112 @@ export default class AgentSleep extends View {
       setShared(VISIBLE_KEY, next);
     }
     if (periodic && shared(LEADER_KEY)?.id === this.id) setShared(LEADER_KEY, { id: this.id, at: now });
+    if (cx) this.syncViewed(cx, terms, periodic);
+  }
+
+  // Other machines' terminals shown here: write the time on each when it
+  // shows up and then every PRESENCE_EVERY_MS, for that machine's copy; once
+  // no window of this app shows one any more, remove it. Spawned, never
+  // awaited in render: when render sees the shown set change, or on the
+  // timer. Each terminal
+  // gets its own task, and a machine that isn't reachable is left alone: a
+  // call that hangs there must not stop the others' labels from refreshing.
+  syncViewed(cx, terms, periodic) {
+    const want = terms.filter((a) => !local(a));
+    const key = want.join("\n");
+    if (!periodic && key === this.viewedKey) return;
+    const up = readyMachines();
+    const shown = new Set(want);
+    // Anything held back (a machine not ready yet, a task still running) is
+    // tried again at the next render, not only at the next timer tick.
+    let done = true;
+    for (const [a, at] of [...this.viewed]) {
+      if (shown.has(a)) continue;
+      if (!up.has(machineOf(a)) || !this.labelJob(cx, a, () => this.unview(a, at))) done = false;
+    }
+    const now = Date.now();
+    for (const a of shown) {
+      if (!up.has(machineOf(a))) {
+        done = false;
+        continue;
+      }
+      // Every timer tick rewrites (a label is then at most PRESENCE_EVERY_MS
+      // old, as VIEWED_STALE_MS assumes); render only writes new ones.
+      if (!periodic && this.viewed.has(a)) continue;
+      // A write that failed is retried by the timer, not by every render.
+      if (!periodic && now - (this.failedView.get(a) ?? 0) < PRESENCE_EVERY_MS) continue;
+      const started = this.labelJob(cx, a, async () => {
+        if ((await hc(["label", a, `${VIEWED}=${now}`])).code === 0) {
+          this.viewed.set(a, now);
+          this.failedView.delete(a);
+        } else this.failedView.set(a, now);
+      });
+      if (!started) done = false;
+    }
+    this.viewedKey = done ? key : null;
+  }
+
+  // One label task per terminal at a time; one still running after
+  // REFRESH_STUCK_MS no longer blocks the next. False when held back.
+  labelJob(cx, address, job) {
+    const running = this.labelling.get(address);
+    if (running && Date.now() - running.at < REFRESH_STUCK_MS) return false;
+    const mine = { at: Date.now() };
+    this.labelling.set(address, mine);
+    cx.spawn(async () => {
+      try {
+        await job();
+      } catch (e) {
+        console.log(`agent-sleep: ${e?.message ?? e}`);
+      } finally {
+        if (this.labelling.get(address) === mine) this.labelling.delete(address);
+      }
+    });
+    return true;
+  }
+
+  // Kept when another window of this app still shows it (that copy removes
+  // it later), or when the label is no longer this copy's write: another
+  // machine's app shows it too.
+  // `closing`: this copy is going away, so what its window shows no longer counts.
+  async unview(address, at, closing = false) {
+    this.viewed.delete(address);
+    const now = Date.now();
+    const others = Object.entries(shared(VISIBLE_KEY) ?? {}).filter(([id, v]) => id !== this.id && now - (v?.at ?? 0) < LEADER_STALE_MS);
+    if (others.some(([, v]) => (v.terms ?? []).includes(address))) return;
+    const { ok, t } = await getTerminal(address);
+    if (!ok || t?.labels?.[VIEWED] !== String(at)) return;
+    // Shown here again meanwhile (a quick tab switch): the write that showing
+    // asked for was held back by this task, so make it now instead.
+    if (!closing && shownHere().has(address)) {
+      const now = Date.now();
+      if ((await hc(["label", address, `${VIEWED}=${now}`])).code === 0) this.viewed.set(address, now);
+      return;
+    }
+    await hc(["label", address, `${VIEWED}=`]);
+    // Shown again during the clear: the write that asked for was held back
+    // by this task, so make it now.
+    if (!closing && shownHere().has(address)) {
+      const now = Date.now();
+      if ((await hc(["label", address, `${VIEWED}=${now}`])).code === 0) this.viewed.set(address, now);
+    }
   }
 
   // Leaving (pane closed, app quit): hand the lead over at once instead of
   // making the next copy wait for it to go stale.
   async close() {
     if (shared(LEADER_KEY)?.id === this.id) setShared(LEADER_KEY, null);
+    const mine = [...this.viewed];
     const now = Date.now();
     const all = {};
     for (const [id, v] of Object.entries(shared(VISIBLE_KEY) ?? {})) {
       if (id !== this.id && now - (v?.at ?? 0) < LEADER_STALE_MS) all[id] = v;
     }
     setShared(VISIBLE_KEY, Object.keys(all).length ? all : null);
+    // Best effort: close() gets a short time on quit. All at once; a label
+    // left behind expires after VIEWED_STALE_MS anyway.
+    const up = readyMachines();
+    await Promise.allSettled(mine.filter(([a]) => up.has(machineOf(a))).map(([a, at]) => this.unview(a, at, true)));
   }
 
   claim(address) {
@@ -419,7 +537,7 @@ export default class AgentSleep extends View {
       if (!a || a.pinned || visibleTerminals().has(address)) return null;
       if (a.status !== "done" && a.status !== "idle") return null;
       const { ok, t } = await getTerminal(address);
-      if (!ok || !t || t.state !== "live" || t.labels?.[L.session]) return null;
+      if (!ok || !t || t.state !== "live" || t.labels?.[L.session] || viewedElsewhere(t)) return null;
       const st = t.status?.state;
       if (st !== "done" && st !== "idle") return null;
       if (!t.status_ms || Date.now() - t.status_ms < wait) return null;
@@ -494,13 +612,18 @@ export default class AgentSleep extends View {
   // Only within PROMPT_WINDOW_MS of the quit, and never while the terminal is
   // on screen (the person could be typing there).
   async recordPrompt(cx, address, quitAt) {
-    const fresh = () => quitAt > 0 && Date.now() - quitAt < PROMPT_WINDOW_MS && !visibleTerminals().has(address);
-    if (!fresh()) return;
+    // Shown in another machine's app counts too: the label is read fresh.
+    const fresh = async () => {
+      if (!(quitAt > 0 && Date.now() - quitAt < PROMPT_WINDOW_MS) || visibleTerminals().has(address)) return false;
+      const { ok, t } = await getTerminal(address);
+      return ok && !viewedElsewhere(t);
+    };
+    if (!(await fresh())) return;
     let before = await lastLine(address);
     for (let i = 0; i < 6; i++) {
       await cx.sleep(500);
       const now = await lastLine(address);
-      if (!fresh()) return;
+      if (!(await fresh())) return;
       if (now !== null && now === before) {
         await setLabels(address, { [L.prompt]: now });
         return;
@@ -682,7 +805,7 @@ export default class AgentSleep extends View {
     const sort = sortMode();
     const list = sortRows(this.sleeping(), sort, now);
     if (!isDemo()) {
-      this.presence();
+      this.presence(false, cx);
       this.markSeen(list, cx);
       this.fit(list.length);
     }

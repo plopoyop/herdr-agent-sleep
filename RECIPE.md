@@ -31,7 +31,9 @@ resumes it with its whole conversation.
   block of the shown layout outside hidden nodes and inactive stack children,
   plus what other copies announced in shared `agent-sleep.visible`: each copy
   rewrites its own entry on change and every 15 s, entries older than 45 s
-  are ignored, `close()` removes it), pinned, not idle for
+  are ignored, `close()` removes it), shown in another machine's app
+  (`agent-sleep.viewed` within 105 s, either way: 15 s between writes plus
+  90 s of clock difference), pinned, not idle for
   longer than the delay (`status_ms`), not a child of a shell (`argv[0]` is a
   shell and `foreground.pid != pid`), not matched by an adapter, without a
   well-formed session id, started less than the delay ago, with a draft in
@@ -53,7 +55,8 @@ resumes it with its whole conversation.
   clear the state, set `agent-sleep.since`, and record the shell's last
   non-empty line in `agent-sleep.prompt` once two reads 500 ms apart agree
   (the prompt is drawn a moment after the quit), only within 10 s of the quit
-  and only while the terminal isn't visible: later, the person may have typed
+  and only while the terminal isn't visible, here or in another machine's app
+  (`agent-sleep.viewed`, read again before each read): later, the person may have typed
   there. Not recorded → a wake falls back to the toast. Nothing is typed into
   the shell. The label write is checked: if it fails, no quit is sent.
 - List: labelled terminals with a valid session and a known adapter; a
@@ -69,7 +72,9 @@ resumes it with its whole conversation.
   the same toast unless it was waking; back on the shell after that → clear
   `agent-sleep.at`; `waking` for
   over 2 min with the agent not running → back to asleep; asleep with no
-  recorded prompt → try again, still only within 10 s of the quit. An unknown `agent-sleep.agent` is left alone (and not listed). A failed `hc get` changes
+  recorded prompt → try again, still only within 10 s of the quit, and not
+  while another machine's app shows it (fresh `agent-sleep.viewed`, read again
+  before each read of the line). An unknown `agent-sleep.agent` is left alone (and not listed). A failed `hc get` changes
   nothing. A malformed session id → drop the labels.
 - An agent whose Herdr status (`agents()`) was `done` (finished unseen) when it fell asleep gets
   `agent-sleep.unseen=1`; showing its terminal or waking it clears it.
@@ -88,6 +93,22 @@ resumes it with its whole conversation.
   labels as soon as the agent runs with that session. A waking row whose
   terminal is back in `agents()` (a sleeping one, on its shell, isn't) is
   hidden at once.
+- Terminals of another machine shown in this window (same set as above) get
+  `agent-sleep.viewed=<ms>` when they show up and every 15 s after, so that
+  machine's copy leaves them awake; once no window of this app shows one
+  (other copies' fresh `agent-sleep.visible` entries, this copy's own view
+  left out), the label is removed if it still holds this copy's last write
+  (otherwise another machine's app shows it too) and this window doesn't show
+  it again by then (if it does, the label is rewritten instead). Each terminal gets its own
+  spawned task (one at a time per terminal, a task stuck over 60 s no longer
+  blocks the next), spawned and never awaited in `render()`: when `render()`
+  sees the shown set change (and at each render while a write was held
+  back: machine not ready yet, a task still running; a write that failed
+  is retried at most every 15 s), or by the 15 s timer,
+  which rewrites every shown one; terminals of a machine not `ready` in
+  `machines()` are left alone. `close()` removes this copy's labels all at
+  once, even of terminals still on screen, best effort (it gets little time on quit): a label left behind
+  expires after 105 s.
 - Click the order chip: by space (Herdr's terminal order) → longest asleep
   first → newest asleep first (shared key `agent-sleep.sort`, so every copy
   agrees). A row falling asleep, with no sleep time yet, counts as asleep
@@ -141,7 +162,8 @@ resumes it with its whole conversation.
   `agent-sleep.title`, `agent-sleep.since`, `agent-sleep.unseen`,
   `agent-sleep.state` + `agent-sleep.at`, `agent-sleep.prompt`,
   `agent-sleep.waker`, `agent-sleep.cwd` (the agent's folder, written with the
-  others before the quit). `settle()`
+  others before the quit), `agent-sleep.viewed` (written by another machine's
+  copy showing it). `settle()`
   reads them fresh from `hc get`, never from the list it started from.
 - Block props `demo: true`: sample rows (`api`, `web`, `infra`, `docs`), no
   timer, no actions. `preview.png` is a shot of it, so no real work shows.
@@ -169,6 +191,10 @@ resumes it with its whole conversation.
   typing into that agent in the second after the last check, the quit lands
   after their text. Narrow the window (re-check just before), don't claim it
   is closed.
+- Removing `agent-sleep.viewed` checks that it still holds this copy's write,
+  then clears it: two calls, not atomic. Another machine's app writing in
+  between loses its label until its next write (15 s). Labels have no
+  compare-and-set; keep the gap to those two calls.
 - `hc send` from inside an agent's terminal wraps the text in `<hc from=…>`
   tags; from the app (a mod) it doesn't. Test wake from the mod.
 - The prompt marker check is deliberately conservative: no marker found
@@ -189,3 +215,5 @@ resumes it with its whole conversation.
 - Setting `agent-sleep=$(id)` on a terminal by hand doesn't list it, and
   clicking never types it.
 - "off" stops new sleeps; already sleeping agents stay listed.
+- With the mod on two connected machines, an agent of one shown in the other's
+  window stays awake.
