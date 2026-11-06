@@ -7,8 +7,10 @@
 // Clicking it types the agent's resume command in that shell.
 //
 // Left awake: agents shown in the window (focused, or any pane of the tab on
-// screen), pinned agents, agents with text in their prompt, agents not
-// started from a shell, agents on other machines.
+// screen), agents shown in another machine's app (agent-sleep.viewed), pinned
+// agents, agents with text in their prompt, agents not started from a shell.
+// Agents on other machines are put to sleep by their machine's copy: this one
+// lists them (read every 30 s) and wakes them.
 //
 // State lives on the terminal as labels (visible with `hc get`), so it
 // survives app restarts and every copy of this mod agrees:
@@ -19,6 +21,7 @@
 //   agent-sleep.prompt=<the shell's last line once asleep>
 //   agent-sleep.cwd=<the agent's folder>  (for uninstall.sh's saved commands)
 //   agent-sleep.waker=<copy id>  (which copy types the resume command)
+//   agent-sleep.viewed=<ms>      (shown in another machine's app, written by it)
 //
 // Nothing is typed into a sleeping terminal's shell unless its last line is
 // still exactly what it was when the agent fell asleep: text the person typed
@@ -26,7 +29,7 @@
 
 import { View, div, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { agents, terminals, panes, spaces, focused, theme, run, hc, shared, setShared, notify, layout, props } from "herdr";
+import { agents, terminals, panes, spaces, machines, focused, theme, run, hc, shared, setShared, notify, layout, props } from "herdr";
 import { adapterFor, adapterById, isSessionId } from "./adapters.js";
 
 const LABEL = "agent-sleep";
@@ -63,7 +66,28 @@ const LEADER_KEY = "agent-sleep.leader";
 const PRESENCE_EVERY_MS = 15_000;
 const LEADER_STALE_MS = 3 * PRESENCE_EVERY_MS;
 const VISIBLE_KEY = "agent-sleep.visible";
+// Shared keys stay inside one app: a copy that shows a terminal of another
+// machine writes the time on that terminal instead, and that machine's copy
+// leaves it awake. A label is rewritten every PRESENCE_EVERY_MS, so it can be
+// that old when read: on top of that, clocks may be up to 90 s apart.
+const VIEWED = `${LABEL}.viewed`;
+const VIEWED_STALE_MS = PRESENCE_EVERY_MS + 90_000;
+// A read of other machines' terminals that hasn't finished after this long
+// (an unreachable machine) no longer blocks the next one.
+const REFRESH_STUCK_MS = 60_000;
+// A wake gives up (toast) if the terminal can't be read in this time.
+const WAKE_READ_TIMEOUT_MS = 30_000;
 const DELAY_KEY = "agent-sleep.delay";
+// Order of the Sleeping list, shared like the delay: by space (the order
+// Herdr keeps the terminals in), longest asleep first, or newest first.
+const SORT_KEY = "agent-sleep.sort";
+const SORTS = ["space", "longest", "newest"];
+const SORT_LABEL = { space: "by space", longest: "longest", newest: "newest" };
+const SORT_TIP = {
+  space: "Sorted by space (click to change)",
+  longest: "Longest asleep first (click to change)",
+  newest: "Newest asleep first (click to change)",
+};
 
 // Fit (block props `fit: true`): the Agents block and this one take the
 // height of their rows, so the Sleeping list sits right under the agents and
@@ -126,6 +150,19 @@ const delay = () => {
   return DELAYS.includes(d) ? d : DEFAULT_DELAY;
 };
 
+const sortMode = () => {
+  const s = shared(SORT_KEY);
+  return SORTS.includes(s) ? s : "space";
+};
+
+// Rows without a sleep time yet (falling asleep) count as asleep since now.
+function sortRows(list, mode, now) {
+  if (mode === "space") return list;
+  const since = (s) => Number(s.labels[L.since]) || now;
+  const dir = mode === "longest" ? 1 : -1;
+  return [...list].sort((a, b) => dir * (since(a) - since(b)));
+}
+
 function duration(ms) {
   const m = Math.floor(ms / 60000);
   if (m < 1) return "<1m";
@@ -154,6 +191,15 @@ async function lastLine(address) {
 }
 
 const local = (address) => !String(address).includes("/");
+// `vps/t7` → "vps"; null for this machine.
+const machineOf = (address) => (local(address) ? null : String(address).split("/")[0]);
+// Other machines this app reaches now (`machines()`: offline ones aren't ready).
+const readyMachines = () => new Set(machines().filter((m) => m.name && m.layout === "ready").map((m) => m.name));
+// Shown lately in a window of another machine's app (both ways: clocks differ).
+const viewedElsewhere = (t) => {
+  const at = Number(t?.labels?.[VIEWED]);
+  return at > 0 && Math.abs(Date.now() - at) < VIEWED_STALE_MS;
+};
 // A login shell's argv[0] starts with "-" ("-bash", "-zsh").
 const basename = (p) => String(p ?? "").split("/").pop().replace(/^-/, "");
 const onShell = (t) => SHELLS.has(basename(t?.foreground?.name));
@@ -203,17 +249,29 @@ export default class AgentSleep extends View {
     this.running = false; // one tick at a time
     this.folded = false;
     this.seeing = new Set(); // unseen marks being cleared
-    this.waking = new Set(); // rows clicked, shown as waking before any label is written
+    this.waking = new Map(); // rows clicked → when, shown as waking before any label is written
+    this.viewed = new Map(); // other machines' terminals shown here → last VIEWED write
+    this.wakeSeen = new Map(); // `${address}@${at}` → when this copy first saw that wake
+    this.remote = []; // other machines' sleeping agents, read by refreshRemote()
+    this.refreshing = 0; // when the running read started, 0 = none
+    this.remoteGen = 0; // a read whose generation is no longer this one is dropped
+    this.viewedKey = null; // other machines' terminals shown here, last synced
+    this.labelling = new Map(); // address → its label task under way ({ at })
+    this.failedView = new Map(); // address → when writing its VIEWED label last failed
+    this.remoteBy = new Map(); // machine → its sleeping agents, from the last read
+    this.reading = new Map(); // machine → its read under way ({ at })
     if (isDemo()) return;
     cx.timer.every(CHECK_EVERY_MS, (cx) => this.tick(cx));
-    cx.timer.every(PRESENCE_EVERY_MS, () => this.presence(true));
-    this.presence(true);
+    cx.timer.every(CHECK_EVERY_MS, (cx) => this.refreshRemote(cx));
+    cx.timer.every(PRESENCE_EVERY_MS, (cx) => this.presence(true, cx));
+    this.presence(true, cx);
     this.tick(cx);
+    this.refreshRemote(cx);
   }
 
   // Announce what this window shows (on change, and every PRESENCE_EVERY_MS
   // so it doesn't go stale), drop stale entries, and keep the lead alive.
-  presence(periodic = false) {
+  presence(periodic = false, cx = null) {
     const terms = [...shownHere()].sort();
     const all = shared(VISIBLE_KEY) ?? {};
     const mine = all[this.id];
@@ -224,18 +282,232 @@ export default class AgentSleep extends View {
       setShared(VISIBLE_KEY, next);
     }
     if (periodic && shared(LEADER_KEY)?.id === this.id) setShared(LEADER_KEY, { id: this.id, at: now });
+    if (cx) this.syncViewed(cx, terms, periodic);
+  }
+
+  // Other machines' terminals shown here: write the time on each when it
+  // shows up and then every PRESENCE_EVERY_MS, for that machine's copy; once
+  // no window of this app shows one any more, remove it. Spawned, never
+  // awaited in render: when render sees the shown set change, or on the
+  // timer. Each terminal
+  // gets its own task, and a machine that isn't reachable is left alone: a
+  // call that hangs there must not stop the others' labels from refreshing.
+  syncViewed(cx, terms, periodic) {
+    const want = terms.filter((a) => !local(a));
+    const key = want.join("\n");
+    if (!periodic && key === this.viewedKey) return;
+    const up = readyMachines();
+    const shown = new Set(want);
+    // Anything held back (a machine not ready yet, a task still running) is
+    // tried again at the next render, not only at the next timer tick.
+    let done = true;
+    for (const [a, at] of [...this.viewed]) {
+      if (shown.has(a)) continue;
+      if (!up.has(machineOf(a)) || !this.labelJob(cx, a, () => this.unview(a, at))) done = false;
+    }
+    const now = Date.now();
+    for (const a of shown) {
+      if (!up.has(machineOf(a))) {
+        done = false;
+        continue;
+      }
+      // Every timer tick rewrites (a label is then at most PRESENCE_EVERY_MS
+      // old, as VIEWED_STALE_MS assumes); render only writes new ones.
+      if (!periodic && this.viewed.has(a)) continue;
+      // A write that failed is retried by the timer, not by every render.
+      if (!periodic && now - (this.failedView.get(a) ?? 0) < PRESENCE_EVERY_MS) continue;
+      const started = this.labelJob(cx, a, async () => {
+        if ((await hc(["label", a, `${VIEWED}=${now}`])).code === 0) {
+          this.viewed.set(a, now);
+          this.failedView.delete(a);
+        } else this.failedView.set(a, now);
+      });
+      if (!started) done = false;
+    }
+    this.viewedKey = done ? key : null;
+  }
+
+  // One label task per terminal at a time; one still running after
+  // REFRESH_STUCK_MS no longer blocks the next. False when held back.
+  labelJob(cx, address, job) {
+    const running = this.labelling.get(address);
+    if (running && Date.now() - running.at < REFRESH_STUCK_MS) return false;
+    const mine = { at: Date.now() };
+    this.labelling.set(address, mine);
+    cx.spawn(async () => {
+      try {
+        await job();
+      } catch (e) {
+        console.log(`agent-sleep: ${e?.message ?? e}`);
+      } finally {
+        if (this.labelling.get(address) === mine) this.labelling.delete(address);
+      }
+    });
+    return true;
+  }
+
+  // Kept when another window of this app still shows it (that copy removes
+  // it later), or when the label is no longer this copy's write: another
+  // machine's app shows it too.
+  // `closing`: this copy is going away, so what its window shows no longer counts.
+  async unview(address, at, closing = false) {
+    this.viewed.delete(address);
+    const now = Date.now();
+    const others = Object.entries(shared(VISIBLE_KEY) ?? {}).filter(([id, v]) => id !== this.id && now - (v?.at ?? 0) < LEADER_STALE_MS);
+    if (others.some(([, v]) => (v.terms ?? []).includes(address))) return;
+    const { ok, t } = await getTerminal(address);
+    if (!ok || t?.labels?.[VIEWED] !== String(at)) return;
+    // Shown here again meanwhile (a quick tab switch): the write that showing
+    // asked for was held back by this task, so make it now instead.
+    if (!closing && shownHere().has(address)) {
+      const now = Date.now();
+      if ((await hc(["label", address, `${VIEWED}=${now}`])).code === 0) this.viewed.set(address, now);
+      return;
+    }
+    await hc(["label", address, `${VIEWED}=`]);
+    // Shown again during the clear: the write that asked for was held back
+    // by this task, so make it now.
+    if (!closing && shownHere().has(address)) {
+      const now = Date.now();
+      if ((await hc(["label", address, `${VIEWED}=${now}`])).code === 0) this.viewed.set(address, now);
+    }
+  }
+
+  // A wake's `at` comes from the clock of the machine that clicked: time it
+  // from when this copy first saw it instead.
+  wakeAge(address, at) {
+    const now = Date.now();
+    for (const [k, seen] of this.wakeSeen) if (now - seen > 2 * STEP_TIMEOUT_MS) this.wakeSeen.delete(k);
+    const key = `${address}@${at}`;
+    if (!this.wakeSeen.has(key)) this.wakeSeen.set(key, now);
+    return now - this.wakeSeen.get(key);
+  }
+
+  // Other machines' terminals come without labels in terminals(): read those
+  // not running an agent with `hc get`. Their machine's copy puts them to
+  // sleep and settles them; this one only lists and wakes them. Machines are
+  // read side by side and each one's rows show as soon as it answers. One
+  // that isn't reachable is skipped, and so is one whose earlier read hasn't
+  // answered yet; once that read passes REFRESH_STUCK_MS, at the next pass
+  // (ready, but not responding), its rows
+  // go (they couldn't be woken) and a new read is started.
+  refreshRemote(cx) {
+    if (this.refreshing && Date.now() - this.refreshing < REFRESH_STUCK_MS) return;
+    const gen = ++this.remoteGen;
+    this.refreshing = Date.now();
+    cx.spawn(async (cx) => {
+      try {
+        const awake = new Set(agents().map((a) => a.address));
+        const up = readyMachines();
+        const byMachine = new Map();
+        for (const t of terminals()) {
+          if (t.state !== "live" || local(t.address) || awake.has(t.address)) continue;
+          const m = machineOf(t.address);
+          if (!up.has(m)) continue;
+          if (!byMachine.has(m)) byMachine.set(m, []);
+          byMachine.get(m).push(t.address);
+        }
+        const now = Date.now();
+        for (const m of [...this.remoteBy.keys()]) {
+          const pending = this.reading.get(m);
+          const stuck = pending && now - pending.at >= REFRESH_STUCK_MS;
+          if (stuck || !up.has(m) || (!byMachine.has(m) && !pending)) this.remoteBy.delete(m);
+        }
+        // Still being read by an earlier pass: leave it to that one, unless
+        // that read is stuck; then a new one replaces it (its late answer is
+        // dropped by the generation, its clean-up by the `mine` check).
+        for (const [m, pending] of this.reading) if (now - pending.at < REFRESH_STUCK_MS) byMachine.delete(m);
+        this.publishRemote(gen);
+        cx.notify();
+        await Promise.all([...byMachine].map(async ([m, addresses]) => {
+          const mine = { at: Date.now() };
+          this.reading.set(m, mine);
+          try {
+            const found = await this.readMachine(addresses);
+            if (gen !== this.remoteGen) return; // a later read took over
+            this.remoteBy.set(m, found);
+            this.publishRemote(gen);
+            cx.notify();
+          } catch (e) {
+            console.log(`agent-sleep: ${e?.message ?? e}`);
+          } finally {
+            if (this.reading.get(m) === mine) this.reading.delete(m);
+          }
+        }));
+      } catch (e) {
+        console.log(`agent-sleep: ${e?.message ?? e}`);
+      } finally {
+        if (gen === this.remoteGen) this.refreshing = 0;
+      }
+      cx.notify();
+    });
+  }
+
+  // One machine's sleeping agents, from `hc get` of each of its terminals.
+  async readMachine(addresses) {
+    const found = [];
+    for (const address of addresses) {
+      const { ok, t } = await getTerminal(address);
+      if (!ok || t?.state !== "live" || !t.labels?.[L.session]) continue;
+      // Running again (woken, its machine's copy not done settling yet): awake.
+      if (adapterById(t.labels[L.agent])?.isRunning(t)) continue;
+      const labels = { ...t.labels };
+      // Its machine's copy ends a failed wake; when that copy isn't running,
+      // a wake started here would stay "waking…" for good.
+      const at = Number(labels[L.at]);
+      if (labels[L.state] === "waking" && at > 0 && this.wakeAge(address, at) > STEP_TIMEOUT_MS) {
+        // Read again: another window may have started a new wake meanwhile.
+        const again = await getTerminal(address);
+        if (!again.ok || again.t?.labels?.[L.state] !== "waking" || Number(again.t.labels[L.at]) !== at) {
+          if (again.ok && again.t?.labels?.[L.session]) found.push({ address, labels: { ...again.t.labels } });
+          continue;
+        }
+        if ((await setLabels(address, { [L.state]: "", [L.at]: "", [L.waker]: "" })).code === 0) {
+          for (const k of [L.state, L.at, L.waker]) delete labels[k];
+        }
+      }
+      found.push({ address, labels });
+    }
+    return found;
+  }
+
+  // Only the latest read shows: an older one still answering is dropped.
+  publishRemote(gen) {
+    if (gen !== this.remoteGen) return false;
+    this.remote = [...this.remoteBy.values()].flat();
+    return true;
+  }
+
+  // A read under way may have seen it before: its result must not come back.
+  dropRemote(address) {
+    for (const [m, rows] of this.remoteBy) this.remoteBy.set(m, rows.filter((r) => r.address !== address));
+    this.remote = this.remote.filter((r) => r.address !== address);
+    this.remoteGen++;
+    this.refreshing = 0;
   }
 
   // Leaving (pane closed, app quit): hand the lead over at once instead of
   // making the next copy wait for it to go stale.
   async close() {
     if (shared(LEADER_KEY)?.id === this.id) setShared(LEADER_KEY, null);
+    const mine = [...this.viewed];
     const now = Date.now();
     const all = {};
     for (const [id, v] of Object.entries(shared(VISIBLE_KEY) ?? {})) {
       if (id !== this.id && now - (v?.at ?? 0) < LEADER_STALE_MS) all[id] = v;
     }
     setShared(VISIBLE_KEY, Object.keys(all).length ? all : null);
+    // Best effort: close() gets a short time on quit. All at once; a label
+    // left behind expires after VIEWED_STALE_MS anyway.
+    const up = readyMachines();
+    await Promise.allSettled(mine.filter(([a]) => up.has(machineOf(a))).map(([a, at]) => this.unview(a, at, true)));
+  }
+
+  // A click shows "waking…" until the agent runs, for STEP_TIMEOUT_MS at
+  // most: a call stuck on another machine must not leave the row unclickable.
+  wakingHere(address) {
+    const at = this.waking.get(address);
+    return at !== undefined && Date.now() - at < STEP_TIMEOUT_MS;
   }
 
   claim(address) {
@@ -257,11 +529,13 @@ export default class AgentSleep extends View {
     // joins this list the moment it leaves that one ("falling asleep…"), and
     // a waking one leaves it the moment it's back there.
     const awake = new Set(agents().map((a) => a.address));
-    return this.labelled().filter((t) => {
+    return [...this.labelled(), ...this.remote].filter((t) => {
       if (!isSessionId(t.labels[L.session]) || !adapterById(t.labels[L.agent])) return false;
+      // Another machine's row is a snapshot: once its agent runs, it's awake.
+      if (!local(t.address) && awake.has(t.address)) return false;
       const state = t.labels[L.state];
       if (state === "quitting") return !awake.has(t.address);
-      if (state === "waking" || this.waking.has(t.address)) return !awake.has(t.address);
+      if (state === "waking" || this.wakingHere(t.address)) return !awake.has(t.address);
       return true;
     });
   }
@@ -320,7 +594,7 @@ export default class AgentSleep extends View {
         // `at` is written with `state` in one label call: missing or garbage
         // means tampered with, so count it as timed out.
         const at = Number(labels[L.at]) > 0 ? Number(labels[L.at]) : 0;
-        const age = at ? Date.now() - at : Infinity;
+        const age = !at ? Infinity : state === "waking" ? this.wakeAge(s.address, at) : Date.now() - at;
 
         if (state === "quitting") {
           if (onShell(t)) await this.finishSleep(cx, s.address, at);
@@ -396,7 +670,7 @@ export default class AgentSleep extends View {
       if (!a || a.pinned || visibleTerminals().has(address)) return null;
       if (a.status !== "done" && a.status !== "idle") return null;
       const { ok, t } = await getTerminal(address);
-      if (!ok || !t || t.state !== "live" || t.labels?.[L.session]) return null;
+      if (!ok || !t || t.state !== "live" || t.labels?.[L.session] || viewedElsewhere(t)) return null;
       const st = t.status?.state;
       if (st !== "done" && st !== "idle") return null;
       if (!t.status_ms || Date.now() - t.status_ms < wait) return null;
@@ -471,13 +745,18 @@ export default class AgentSleep extends View {
   // Only within PROMPT_WINDOW_MS of the quit, and never while the terminal is
   // on screen (the person could be typing there).
   async recordPrompt(cx, address, quitAt) {
-    const fresh = () => quitAt > 0 && Date.now() - quitAt < PROMPT_WINDOW_MS && !visibleTerminals().has(address);
-    if (!fresh()) return;
+    // Shown in another machine's app counts too: the label is read fresh.
+    const fresh = async () => {
+      if (!(quitAt > 0 && Date.now() - quitAt < PROMPT_WINDOW_MS) || visibleTerminals().has(address)) return false;
+      const { ok, t } = await getTerminal(address);
+      return ok && !viewedElsewhere(t);
+    };
+    if (!(await fresh())) return;
     let before = await lastLine(address);
     for (let i = 0; i < 6; i++) {
       await cx.sleep(500);
       const now = await lastLine(address);
-      if (!fresh()) return;
+      if (!(await fresh())) return;
       if (now !== null && now === before) {
         await setLabels(address, { [L.prompt]: now });
         return;
@@ -490,14 +769,14 @@ export default class AgentSleep extends View {
   wake(s, cx) {
     if (isDemo()) return;
     const sessionId = s.labels[L.session];
-    if (!isSessionId(sessionId) || s.labels[L.state] || this.waking.has(s.address)) return; // quitting or waking
+    if (!isSessionId(sessionId) || s.labels[L.state] || this.wakingHere(s.address)) return; // quitting or waking
     const adapter = adapterById(s.labels[L.agent]);
     if (!adapter) return;
     const cmd = adapter.resume(sessionId);
     // Show it at once: the row says "waking…" and its tab comes up from the
     // click on. Text typed there before the command is caught by the line
     // check right before typing (it falls back to the toast).
-    this.waking.add(s.address);
+    this.waking.set(s.address, Date.now());
     run("pane.focus", { terminal: s.address });
     cx.notify();
     const byHand = (why) => {
@@ -516,7 +795,12 @@ export default class AgentSleep extends View {
       }
       let sent = false;
       try {
-        const { ok, t } = await getTerminal(s.address);
+        // Another machine may stop answering: don't wait on it for good.
+        // Nothing has been written yet, so giving up here is safe.
+        const { ok, t } = await Promise.race([
+          getTerminal(s.address),
+          cx.sleep(WAKE_READ_TIMEOUT_MS).then(() => ({ ok: false, t: null })),
+        ]);
         if (!ok || !t) return byHand(`Couldn't read ${s.address}.`);
         if (t.labels?.[L.session] !== sessionId) return; // changed since the click: nothing to wake
         if (t.labels?.[L.state]) return; // already waking (a second click)
@@ -553,6 +837,8 @@ export default class AgentSleep extends View {
           await this.awaitAwake(cx, s.address, adapter, sessionId);
         } finally {
           this.waking.delete(s.address);
+          // Another machine's row: read its labels again rather than wait 30 s.
+          if (!local(s.address)) this.refreshRemote(cx);
           cx.notify();
         }
       }
@@ -565,6 +851,12 @@ export default class AgentSleep extends View {
       const { ok, t } = await getTerminal(address);
       if (!ok || !t || t.labels?.[L.session] !== sessionId || t.labels?.[L.state] !== "waking") return;
       if (!adapter.isRunning(t)) continue;
+      // Its session file is on its machine: that machine's copy drops the
+      // labels. Drop the row's snapshot now, or it shows asleep until the refresh.
+      if (!local(address)) {
+        this.dropRemote(address);
+        return;
+      }
       const running = await adapter.session(t.foreground.pid);
       if (running?.id !== sessionId) continue; // not started yet, or settle() will handle it
       if (!this.claim(address)) return;
@@ -586,7 +878,9 @@ export default class AgentSleep extends View {
     this.seeing.add(s.address);
     cx.spawn(async () => {
       try {
-        await hc(["label", s.address, `${L.unseen}=`]);
+        const r = await hc(["label", s.address, `${L.unseen}=`]);
+        // Another machine's row is a snapshot until the next refresh.
+        if (r.code === 0 && !local(s.address)) delete s.labels[L.unseen];
       } finally {
         this.seeing.delete(s.address);
       }
@@ -612,18 +906,26 @@ export default class AgentSleep extends View {
     }
   }
 
+  cycleSort() {
+    setShared(SORT_KEY, SORTS[(SORTS.indexOf(sortMode()) + 1) % SORTS.length]);
+  }
+
   cycleDelay() {
     setShared(DELAY_KEY, DELAYS[(DELAYS.indexOf(delay()) + 1) % DELAYS.length]);
   }
 
   row(t, s, now) {
     const adapter = adapterById(s.labels[L.agent]);
-    const space = spaces().find((sp) => sp.tabs.some((x) => x.id === s.labels?.["herdr.tab"]));
-    const tab = space?.tabs.find((x) => x.id === s.labels?.["herdr.tab"]);
+    // Labels hold ids local to the terminal's machine; the app prefixes remote ones.
+    const machine = machineOf(s.address);
+    const tabId = s.labels?.["herdr.tab"];
+    const tabKey = machine && tabId ? `${machine}/${tabId}` : tabId;
+    const space = spaces().find((sp) => sp.tabs.some((x) => x.id === tabKey));
+    const tab = space?.tabs.find((x) => x.id === tabKey);
     const title = s.labels[L.title] || tab?.name || s.address;
     const since = Number(s.labels[L.since]);
     const unseen = s.labels[L.unseen] === "1";
-    const waking = s.labels[L.state] === "waking" || this.waking.has(s.address);
+    const waking = s.labels[L.state] === "waking" || this.wakingHere(s.address);
     const falling = s.labels[L.state] === "quitting";
     const status = waking ? "waking…" : falling ? "falling asleep…" : null;
     return h_flex()
@@ -642,6 +944,7 @@ export default class AgentSleep extends View {
       .child(h_flex().flex_1().min_w(0).gap(5).items_center()
         .child(div().min_w(0).max_w(120).truncate().text_color(unseen ? t.foreground : t.muted).child(s.labels["demo.space"] ?? space?.name ?? ""))
         .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(`· ${title}`)))
+      .when(Boolean(machine), (el) => el.child(div().flex_none().text_size(10).text_color(t.dim).child(machine)))
       .when(Boolean(status), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(status)))
       .when(!status && since > 0, (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(duration(now - since))))
       .child(unseen
@@ -651,10 +954,11 @@ export default class AgentSleep extends View {
 
   render(cx) {
     const t = theme();
-    const list = this.sleeping();
     const now = Date.now();
+    const sort = sortMode();
+    const list = sortRows(this.sleeping(), sort, now);
     if (!isDemo()) {
-      this.presence();
+      this.presence(false, cx);
       this.markSeen(list, cx);
       this.fit(list.length);
     }
@@ -680,6 +984,11 @@ export default class AgentSleep extends View {
             .child("Sleeping"))
           .child(div().text_color(t.dim).child(String(list.length)))
           .child(div().flex_1())
+          .child(div().id("sleep-sort").px(5).rounded(4).cursor_pointer().text_color(t.dim)
+            .hover((s) => s.bg(t.hover).text_color(t.foreground))
+            .tooltip(SORT_TIP[sort])
+            .on_click(() => this.cycleSort())
+            .child(SORT_LABEL[sort]))
           .child(div().id("sleep-delay").px(5).rounded(4).cursor_pointer().text_color(t.dim)
             .hover((s) => s.bg(t.hover).text_color(t.foreground))
             .tooltip("Sleep idle agents after… (click to change)")

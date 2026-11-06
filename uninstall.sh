@@ -55,7 +55,7 @@ UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 RESUME = {"claude": "claude --resume {}", "codex": "codex resume {}"}
 PROGRAM = {"claude": "claude", "codex": "codex"}
 KEYS = ["agent-sleep"] + [f"agent-sleep.{k}" for k in
-        ("agent", "title", "since", "unseen", "state", "at", "prompt", "waker", "cwd")]
+        ("agent", "title", "since", "unseen", "state", "at", "prompt", "waker", "cwd", "viewed")]
 
 def hc(*args):
     return subprocess.run(["hc", *args], capture_output=True, text=True)

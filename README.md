@@ -27,10 +27,14 @@ what is needed to resume them.
   their rows, so Sleeping sits right under the agents and the spare height
   goes to Spaces.
 - Click **after 5m** in the list header to change the delay: 5, 10, 20, 60 min, or off.
+- Click **by space** in the list header to change the order: by space,
+  longest asleep first, or newest asleep first.
 
 An agent is left awake when:
 
 - it is visible: focused, or in any pane of the tab on screen;
+- it is shown in a window of another machine's app that runs the mod too
+  (`agent-sleep.viewed`, see [Known limits](#known-limits));
 - it is pinned;
 - its prompt holds text you haven't sent;
 - it has work running in the background, which quitting would stop: shells,
@@ -40,7 +44,8 @@ An agent is left awake when:
   `busy` while a background sub-agent runs and `shell` while background
   shells run.
 - it wasn't started from a shell (quitting would close its terminal);
-- it runs on another machine (`hc machine`).
+- it runs on another machine (`hc machine`): that machine's copy of the mod
+  handles it (see below).
 
 "Visible" counts every window of the Herdr app running the mod. All of these
 are checked again right before the quit is typed, and for an idle agent the
@@ -116,7 +121,7 @@ shows sample rows and does nothing (used for `preview.png`).
 Quit the Herdr app first: your terminals keep running (herdr-core), and no
 copy of the mod runs while its settings are removed. The script removes the
 labels it left on terminals (finished ones included), its block from every
-layout, its shared settings (delay) and the mod. Agents asleep at that moment
+layout, its shared settings (delay, order) and the mod. Agents asleep at that moment
 stay on their shell: their resume commands, with the folder to run them in,
 are printed and saved in
 `~/.config/herdr-app/.agent-sleep-backup/<date>/sleeping.txt` before any
@@ -172,10 +177,17 @@ Typing at the wrong moment:
 
 Other windows and clients:
 
-- Visibility is shared only between copies of the mod in the same app (same
-  `~/.config/herdr-app`). An agent shown only in another client (another
-  machine, or a second app instance) counts as not visible and can be put to
-  sleep.
+- Visibility is shared between copies of the mod in the same app (same
+  `~/.config/herdr-app`). A window of another machine's app that shows one of
+  this machine's terminals writes the time on it (`agent-sleep.viewed`, every
+  15 s, removed once no window shows it, unless another machine's app wrote it
+  since), and this machine's copy leaves it awake for 105 s after, and records no shell line for it. That needs the mod
+  on both machines and clocks less than 90 s apart. Removal is best effort
+  (on app quit, or when the other machine became unreachable): a label left
+  behind keeps the agent awake for those 105 s, then counts for nothing; that
+  machine's `uninstall.sh` removes it. An agent shown
+  only in a client without the mod (or a second app instance on the same
+  machine) counts as not visible and can be put to sleep.
 - An agent shown in a floating terminal window or a peek, or shown in place
   of an unfocused pane's terminal, counts as visible only while it has focus.
 - Text typed or sent into a sleeping agent's shell by other means (another
@@ -201,7 +213,9 @@ Agents and shells:
 - Background work is detected from what Claude Code shows and reports
   (footer, session status, shell children), as observed on Claude Code
   2.1.318. A later version that shows it differently may need an update.
-- Agents on other machines (`hc machine`) are never put to sleep.
+- Agents on other machines (`hc machine`) are put to sleep only by the mod
+  running on their machine. This copy lists them (with the machine's name,
+  read every 30 s) and wakes them.
 - Linux and macOS. Codex session lookup reads `/proc` and is Linux only.
 
 ## License
