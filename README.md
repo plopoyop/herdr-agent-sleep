@@ -44,7 +44,8 @@ An agent is left awake when:
   `busy` while a background sub-agent runs and `shell` while background
   shells run.
 - it wasn't started from a shell (quitting would close its terminal);
-- it runs on another machine (`hc machine`).
+- it runs on another machine (`hc machine`): that machine's copy of the mod
+  handles it (see below).
 
 "Visible" counts every window of the Herdr app running the mod. All of these
 are checked again right before the quit is typed, and for an idle agent the
@@ -212,7 +213,9 @@ Agents and shells:
 - Background work is detected from what Claude Code shows and reports
   (footer, session status, shell children), as observed on Claude Code
   2.1.318. A later version that shows it differently may need an update.
-- Agents on other machines (`hc machine`) are never put to sleep.
+- Agents on other machines (`hc machine`) are put to sleep only by the mod
+  running on their machine. This copy lists them (with the machine's name,
+  read every 30 s) and wakes them.
 - Linux and macOS. Codex session lookup reads `/proc` and is Linux only.
 
 ## License

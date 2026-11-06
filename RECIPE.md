@@ -15,7 +15,8 @@ resumes it with its whole conversation.
   "longest" or "newest") and the delay ("after 5m", or "off").
 - One row per sleeping agent, 30 px high, radius 8, hover `hover`: the
   agent's icon (`icons/claude.svg`, `icons/codex.svg`) at 45 % opacity, the
-  space name in `muted` (max 120 px), "· title" in `dim`, the time asleep
+  space name in `muted` (max 120 px), "· title" in `dim`, for an agent of
+  another machine its name in 10 px `dim`, the time asleep
   in 11 px `dim` (`<1m`, `4m`, `2h`, `1d`), and a small "z", or, for an agent
   that finished unseen, a 7 px `done` dot instead and the space name in
   `foreground`.
@@ -74,14 +75,19 @@ resumes it with its whole conversation.
   over 2 min with the agent not running → back to asleep; asleep with no
   recorded prompt → try again, still only within 10 s of the quit, and not
   while another machine's app shows it (fresh `agent-sleep.viewed`, read again
-  before each read of the line). An unknown `agent-sleep.agent` is left alone (and not listed). A failed `hc get` changes
+  before each read of the line). A `waking` state is timed from when this copy
+  first saw it, not from `agent-sleep.at` (written with the clock of the
+  machine that clicked). That time is kept per copy: a new leader or an app
+  restart starts timing again. An unknown `agent-sleep.agent` is left alone (and not listed). A failed `hc get` changes
   nothing. A malformed session id → drop the labels.
 - An agent whose Herdr status (`agents()`) was `done` (finished unseen) when it fell asleep gets
   `agent-sleep.unseen=1`; showing its terminal or waking it clears it.
 - Click a row: show "waking…" (local state, kept until the agent runs, so
-  no flicker) and focus its terminal at once. Then wait up to 10 s for a
+  no flicker, 2 min at most: a call stuck on another machine must not leave
+  the row unclickable) and focus its terminal at once. Then wait up to 10 s for a
   check that holds the terminal; past that, or if `hc get` or a label write
-  fails, the toast. If the session label still matches the row, no state is
+  fails, or the first `hc get` takes over 30 s (another machine not
+  answering), the toast. If the session label still matches the row, no state is
   set (not already waking), a shell is in the foreground and a prompt line is
   recorded: write `state=waking` with `agent-sleep.waker=<copy id>`, re-read
   it (another window may have clicked too: only the last writer types), read
@@ -109,7 +115,30 @@ resumes it with its whole conversation.
   `machines()` are left alone. `close()` removes this copy's labels all at
   once, even of terminals still on screen, best effort (it gets little time on quit): a label left behind
   expires after 105 s.
-- Click the order chip: by space (Herdr's terminal order) → longest asleep
+- Other machines' sleeping agents: every 30 s, `hc get` each live remote
+  terminal not in `agents()` and keep the ones with an `agent-sleep` label
+  whose agent isn't running (one running is awake, labels not yet settled).
+  Machines not `ready` in `machines()` are skipped (their rows go). Machines
+  are read side by side, each one's rows shown as soon as it answers; a
+  machine whose earlier read hasn't answered is not read again; once that read
+  is 60 s old, at the next 30 s pass (so within 90 s), its
+  rows go (ready but not responding: they couldn't be woken) and a new read
+  replaces the stuck one. One
+  pass at a time, one still running after 60 s no longer blocks the next,
+  and only the latest pass's results are kept. A remote row `waking` for
+  over 2 min (timed from when this copy first saw it) with no agent running
+  is put back to asleep from here (after reading it again: another window
+  may have just started a new wake), as its machine's copy would: that copy may
+  not be running.
+  They are listed with the machine's name (tab looked up as
+  `<machine>/<herdr.tab>`), hidden as soon as they are in `agents()`, and
+  woken like local ones; after the send, the row goes once the agent runs:
+  that machine's copy reads the session and drops the labels. The row's
+  snapshot is dropped as soon as the agent runs (a read under way then is
+  discarded), and read again right after (at the next pass if that
+  machine's read was already under way).
+- Click the order chip: by space (Herdr's terminal order, this machine's
+  agents first, then other machines') → longest asleep
   first → newest asleep first (shared key `agent-sleep.sort`, so every copy
   agrees). A row falling asleep, with no sleep time yet, counts as asleep
   since now.
@@ -216,4 +245,5 @@ resumes it with its whole conversation.
   clicking never types it.
 - "off" stops new sleeps; already sleeping agents stay listed.
 - With the mod on two connected machines, an agent of one shown in the other's
-  window stays awake.
+  window stays awake; once asleep, it is listed in both, with the machine's
+  name in the other, and waking it from either resumes it.
