@@ -95,10 +95,16 @@ stays awake.
 
 ## Install
 
-Needs the Herdr app running, and `python3`.
+Needs the Herdr app running, `python3`, and `pgrep` (procps; without it no
+Claude agent ever sleeps, since background shells can't be checked).
+
+What it runs and reads, beyond its own folder: `hc` (`get`, `read`, `label`,
+`send`: it types the quit and resume commands), `ps`, `pgrep`, and for Codex
+`ls /proc`; it reads `~/.claude/sessions/<pid>.json` and
+`/proc/<pid>/cmdline`. It never reaches the network.
 
 ```sh
-git clone <this repo> && cd herdr-agent-sleep
+git clone https://github.com/plopoyop/herdr-agent-sleep.git && cd herdr-agent-sleep
 ./install.sh            # the layout shown now
 ./install.sh main       # or a given layout
 ./install.sh --fit      # also size the lists to their rows
@@ -137,7 +143,12 @@ stay on their shell: their resume commands, with the folder to run them in,
 are printed and saved in
 `~/.config/herdr-app/.agent-sleep-backup/<date>/sleeping.txt` before any
 label is removed. With `--fit`, the Agents block keeps its last size: drag it
-back to taste.
+back to taste. It needs `hc` in your PATH to clear the labels.
+
+Left behind, to delete by hand if you want: the `<layout>-sleep` layout
+`install.sh` cloned from one of Herdr's (switch back with `ctrl-shift-l`
+first), the backups in `~/.config/herdr-app/.agent-sleep-backup/`, and the
+empty `~/.config/herdr-app/data/agent-sleep/` Herdr made for the mod.
 
 ## How it works
 
@@ -155,6 +166,8 @@ restarts and every copy of the mod agrees (`hc get <t>` shows them):
 | `agent-sleep.prompt` | the shell's last line when the agent fell asleep |
 | `agent-sleep.waker` | which copy of the mod is waking it (two windows clicking at once) |
 | `agent-sleep.cwd` | the agent's folder, for the commands `uninstall.sh` saves |
+| `agent-sleep.shell` | the pid of the shell it ran in: the only one read or typed into |
+| `agent-sleep.viewed` | when another machine's app last showed it (that app's copy writes it) |
 
 The labels are written **before** the quit is typed, so a slow quit or an app
 reload never loses the session id; the next check finishes the job. A quit

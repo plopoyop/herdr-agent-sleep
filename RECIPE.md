@@ -232,15 +232,23 @@ resumes it with its whole conversation.
   first, checks the mod in a staging folder, backs up the layout and the old
   mod, and writes the layout atomically.
 - `mods/agent-sleep/main.js`: the view and the engine. `herdr` functions:
-  `agents()`, `terminals()`, `panes()`, `spaces()`, `focused()`, `window()`, `theme()`,
-  `layout()`, `props()`, `run("pane.focus" | "layout.resize")`,
+  `agents()`, `terminals()`, `panes()`, `spaces()`, `machines()`,
+  `focused()`, `window()`, `theme()`, `layout()`, `props()`,
+  `run("pane.focus" | "layout.resize")`,
   `hc([...])` (`get --json`, `read` (screen only, no history), `send`, `label`),
-  `shared` / `setShared`, `notify`, `nextCommand()`; `cx.sleep`, `cx.timer.every`.
+  `exec("ps", ["-o", "ppid=", "-p", pid])`, `readTextFile("/proc/<pid>/cmdline")`,
+  `shared` / `setShared`, `notify`; `cx.sleep`, `cx.timer.every`, `cx.spawn`.
 - `mods/agent-sleep/folders.js`: the space-folders mod's placement rules
-  (its `rule`, `folderOf` and `machineFolder`), mirrored: `placeSpaces`,
-  `folderOrder`, `hasFolders`. Reads shared `space-folders` and `panes()`;
+  (its `rule`, `folderOf` and `machineFolder`), mirrored: exports `MARK`
+  (its avatar colors: `ansi6 #22a99a`, `ansi3 #e3814f`, `ansi4 #5b8def`,
+  `ansi5 #8b7cf6`, `ansi2 #3fae6a`, `ansi1 #d9649a`), `hasFolders`,
+  `placeSpaces`. Reads shared `space-folders`, `layout()` and `panes()`;
   never writes.
-- `mods/agent-sleep/adapters.js`: one adapter per agent, plus `isSessionId`:
+- Icons: `icons/claude.svg` and `icons/codex.svg` are Herdr's own, in its home
+  folder; the mod ships none.
+- `mods/agent-sleep/adapters.js`: one adapter per agent, plus `isSessionId`
+  (`herdr`: `exec`, `readTextFile`, `home()`; programs: `pgrep -l -P <pid>`,
+  `ls -l /proc/<pid>/fd`):
   - Claude Code: `app == "claude-code"`, foreground `claude`; session from
     `~/.claude/sessions/<pid>.json` (`sessionId`, `startedAt`); draft = text
     after `❯` on the last prompt line or on the lines below it up to the `─`
