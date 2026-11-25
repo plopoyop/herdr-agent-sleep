@@ -23,6 +23,12 @@ what is needed to resume them.
   the list until you show its terminal or wake it.
 - **Click one to wake it**: the agent's resume command (`claude --resume <id>`)
   is typed in its shell, and the conversation comes back where it stopped.
+- Or turn on **wake on focus** (click **wake on click** in the list header):
+  a sleeping agent then wakes when you go to its tab or pane and stay there a
+  second, without going through the list. Passing through tabs or peeking
+  doesn't wake them, and if you've already typed in its shell, nothing is
+  typed there. Starting to type in that very second can still land before the
+  resume command: see [Known limits](#known-limits).
 - Optional (`./install.sh --fit`): the Agents and Sleeping lists shrink to
   their rows, so Sleeping sits right under the agents and the spare height
   goes to Spaces.
@@ -124,7 +130,7 @@ shows sample rows and does nothing (used for `preview.png`).
 Quit the Herdr app first: your terminals keep running (herdr-core), and no
 copy of the mod runs while its settings are removed. The script removes the
 labels it left on terminals (finished ones included), its block from every
-layout, its shared settings (delay, order) and the mod. Agents asleep at that moment
+layout, its shared settings (delay, order, wake on focus) and the mod. Agents asleep at that moment
 stay on their shell: their resume commands, with the folder to run them in,
 are printed and saved in
 `~/.config/herdr-app/.agent-sleep-backup/<date>/sleeping.txt` before any
@@ -168,6 +174,9 @@ set by something else can't run a command.
 
 Typing at the wrong moment:
 
+- With **wake on focus**, if you go to a sleeping agent's shell to use it and
+  start typing just as the resume command goes in (about a second after),
+  your text can end up in front of it on the same line.
 - If you start typing into an agent in the second between the last check and
   the quit, the quit is sent after your text, which submits both as a prompt.
 - An agent marked done (finished, not looked at yet) has no last-moment guard

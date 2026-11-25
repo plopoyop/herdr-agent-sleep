@@ -29,7 +29,7 @@
 
 import { View, div, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { agents, terminals, panes, spaces, machines, focused, theme, run, hc, shared, setShared, notify, layout, props } from "herdr";
+import { agents, terminals, panes, spaces, machines, focused, theme, run, hc, shared, setShared, notify, layout, props, window } from "herdr";
 import { adapterFor, adapterById, isSessionId } from "./adapters.js";
 import { MARK, hasFolders, placeSpaces } from "./folders.js";
 
@@ -79,6 +79,14 @@ const REFRESH_STUCK_MS = 60_000;
 // A wake gives up (toast) if the terminal can't be read in this time.
 const WAKE_READ_TIMEOUT_MS = 30_000;
 const DELAY_KEY = "agent-sleep.delay";
+// Wake a sleeping agent when its pane gets the keyboard and keeps it this
+// long (passing through tabs doesn't wake them). Shared like the delay; off
+// unless the person turns it on.
+const FOCUS_WAKE_KEY = "agent-sleep.wake-on-focus";
+const FOCUS_WAKE_MS = 1000;
+// A wake on focus reads the shell's line twice this far apart right before
+// typing: someone starting to type there in between is caught.
+const FOCUS_SETTLE_MS = 300;
 // Order of the Sleeping list, shared like the delay: by space (the order
 // Herdr keeps the terminals in), longest asleep first, newest first, or under
 // the folders of the space-folders mod (offered only when it has some).
@@ -295,10 +303,19 @@ export default class AgentSleep extends View {
     this.failedView = new Map(); // address → when writing its VIEWED label last failed
     this.remoteBy = new Map(); // machine → its sleeping agents, from the last read
     this.reading = new Map(); // machine → its read under way ({ at })
+    // The focused terminal at the last render, and the focus change waiting
+    // to wake it. The first one seen (at start, a reload) never wakes.
+    this.focusSeen = undefined;
+    this.focusBased = false; // a terminal was seen focused once
+    this.focusGen = 0;
+    this.toldQuiet = new Set(); // addresses whose quiet wake failure was toasted once
     if (isDemo()) return;
     cx.timer.every(CHECK_EVERY_MS, (cx) => this.tick(cx));
     cx.timer.every(CHECK_EVERY_MS, (cx) => this.refreshRemote(cx));
-    cx.timer.every(PRESENCE_EVERY_MS, (cx) => this.presence(true, cx));
+    cx.timer.every(PRESENCE_EVERY_MS, (cx) => {
+      this.presence(true, cx);
+      this.rebaseFocus();
+    });
     this.presence(true, cx);
     this.tick(cx);
     this.refreshRemote(cx);
@@ -801,7 +818,9 @@ export default class AgentSleep extends View {
     // Never settled: no prompt recorded, so a wake points to the command instead.
   }
 
-  wake(s, cx) {
+  // `quiet`: a wake on focus, which the person didn't ask for by name: when it
+  // can't go ahead, no toast (the shell is theirs to use).
+  wake(s, cx, { quiet = false } = {}) {
     if (isDemo()) return;
     const sessionId = s.labels[L.session];
     if (!isSessionId(sessionId) || s.labels[L.state] || this.wakingHere(s.address)) return; // quitting or waking
@@ -812,10 +831,14 @@ export default class AgentSleep extends View {
     // click on. Text typed there before the command is caught by the line
     // check right before typing (it falls back to the toast).
     this.waking.set(s.address, Date.now());
-    run("pane.focus", { terminal: s.address });
+    if (!quiet) run("pane.focus", { terminal: s.address });
     cx.notify();
-    const byHand = (why) => {
-      run("pane.focus", { terminal: s.address });
+    // Quiet: nothing when the person is using the terminal (its line changed,
+    // a program in front, busy); a failure they can't see, once per terminal.
+    const byHand = (why, theirs = false) => {
+      if (quiet && (theirs || this.toldQuiet.has(s.address))) return;
+      if (quiet) this.toldQuiet.add(s.address);
+      else run("pane.focus", { terminal: s.address });
       notify({ title: "Wake it by hand", body: `${why} Run: ${cmd}`, level: "warning" });
     };
     cx.spawn(async (cx) => {
@@ -826,7 +849,7 @@ export default class AgentSleep extends View {
       if (!claimed) {
         this.waking.delete(s.address);
         cx.notify();
-        return byHand(`${s.address} is busy right now.`);
+        return byHand(`${s.address} is busy right now.`, true);
       }
       let sent = false;
       try {
@@ -840,7 +863,7 @@ export default class AgentSleep extends View {
         if (t.labels?.[L.session] !== sessionId) return; // changed since the click: nothing to wake
         if (t.labels?.[L.state]) return; // already waking (a second click)
         const expected = t.labels?.[L.prompt];
-        if (!onShell(t)) return byHand(`${s.address} isn't on its shell.`);
+        if (!onShell(t)) return byHand(`${s.address} isn't on its shell.`, true);
         if (!expected) return byHand("Its shell line wasn't recorded.");
         if ((await setLabels(s.address, { [L.state]: "waking", [L.at]: Date.now(), [L.waker]: this.id })).code !== 0) {
           return byHand("Couldn't mark it as waking.");
@@ -849,9 +872,15 @@ export default class AgentSleep extends View {
         const again = await getTerminal(s.address);
         if (!again.ok || again.t?.labels?.[L.waker] !== this.id) return;
         // Last look right before typing: the line must be exactly as it was.
-        if ((await lastLine(s.address)) !== expected) {
+        // On focus the person may be about to type there: look twice.
+        let same = (await lastLine(s.address)) === expected;
+        if (same && quiet) {
+          await cx.sleep(FOCUS_SETTLE_MS);
+          same = (await lastLine(s.address)) === expected && focused()?.terminal === s.address;
+        }
+        if (!same) {
           await setLabels(s.address, { [L.state]: "", [L.at]: "", [L.waker]: "" });
-          return byHand("The shell's line has changed: clear it first.");
+          return byHand("The shell's line has changed: clear it first.", true);
         }
         if ((await hc(["send", s.address, cmd])).code !== 0) {
           await setLabels(s.address, { [L.state]: "", [L.at]: "", [L.waker]: "" });
@@ -905,6 +934,46 @@ export default class AgentSleep extends View {
     }
   }
 
+  // A sleeping agent whose pane gets the keyboard, and keeps it for
+  // FOCUS_WAKE_MS, wakes as a click on its row would, but quietly. Only a
+  // change of focus counts: not the pane focused when this copy starts.
+  // Only a pane's own terminal counts: not a peek, a window or a layout
+  // terminal block (no pane: looking, not asking), nor a pane showing another
+  // terminal in its place.
+  focusTarget() {
+    const f = focused();
+    return f?.pane && !f.shown ? f.terminal ?? null : null;
+  }
+
+  // The first terminal seen (at start, after a reload) is where the person
+  // already was: it never wakes, even when focus comes back after a render.
+  wakeOnFocus(list, cx) {
+    const now = this.focusTarget();
+    if (now === this.focusSeen) return;
+    const first = !this.focusBased;
+    this.focusSeen = now;
+    if (now) this.focusBased = true;
+    const gen = ++this.focusGen;
+    if (first || !now || shared(FOCUS_WAKE_KEY) !== true || !list.some((s) => s.address === now)) return;
+    cx.spawn(async (cx) => {
+      await cx.sleep(FOCUS_WAKE_MS);
+      if (gen !== this.focusGen || this.focusTarget() !== now || window()?.active === false) return;
+      const s = this.sleeping().find((x) => x.address === now);
+      if (s && !s.labels[L.state]) this.wake(s, cx, { quiet: true });
+    });
+  }
+
+  // A hidden copy doesn't render, so it misses focus changes: on the timer, a
+  // focus render didn't see becomes the new starting point, never a wake.
+  rebaseFocus() {
+    const now = this.focusTarget();
+    if (now !== this.focusSeen) {
+      this.focusSeen = now;
+      if (now) this.focusBased = true;
+      this.focusGen++;
+    }
+  }
+
   // Showing a sleeping terminal on screen counts as looking at its result.
   markSeen(list, cx) {
     const shown = visibleTerminals();
@@ -944,6 +1013,10 @@ export default class AgentSleep extends View {
   cycleSort() {
     const all = sorts();
     setShared(SORT_KEY, all[(all.indexOf(sortMode()) + 1) % all.length]);
+  }
+
+  toggleFocusWake() {
+    setShared(FOCUS_WAKE_KEY, shared(FOCUS_WAKE_KEY) !== true);
   }
 
   cycleDelay() {
@@ -1012,6 +1085,7 @@ export default class AgentSleep extends View {
     if (!isDemo()) {
       this.presence(false, cx);
       this.markSeen(list, cx);
+      this.wakeOnFocus(list, cx);
       this.fit(list.length, groups ? groups.length * GROUP_ROW : 0);
     }
     const d = delay();
@@ -1041,6 +1115,14 @@ export default class AgentSleep extends View {
             .tooltip(SORT_TIP[sort])
             .on_click(() => this.cycleSort())
             .child(SORT_LABEL[sort]))
+          .child(div().id("sleep-focus").px(5).rounded(4).cursor_pointer()
+            .text_color(shared(FOCUS_WAKE_KEY) === true ? t.foreground : t.dim)
+            .hover((s) => s.bg(t.hover).text_color(t.foreground))
+            .tooltip(shared(FOCUS_WAKE_KEY) === true
+              ? "Focusing a sleeping agent's pane wakes it (click to turn off)"
+              : "Wake a sleeping agent when its pane gets focus (click to turn on)")
+            .on_click(() => this.toggleFocusWake())
+            .child(shared(FOCUS_WAKE_KEY) === true ? "wake on focus" : "wake on click"))
           .child(div().id("sleep-delay").px(5).rounded(4).cursor_pointer().text_color(t.dim)
             .hover((s) => s.bg(t.hover).text_color(t.foreground))
             .tooltip("Sleep idle agents after… (click to change)")
