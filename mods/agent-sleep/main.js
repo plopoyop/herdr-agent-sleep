@@ -21,6 +21,7 @@
 //   agent-sleep.prompt=<the shell's last line once asleep>
 //   agent-sleep.cwd=<the agent's folder>  (for uninstall.sh's saved commands)
 //   agent-sleep.waker=<copy id>  (which copy types the resume command)
+//   agent-sleep.shell=<pid>      (the shell the agent ran in: the only one read or typed into)
 //   agent-sleep.viewed=<ms>      (shown in another machine's app, written by it)
 //
 // Nothing is typed into a sleeping terminal's shell unless its last line is
@@ -29,7 +30,7 @@
 
 import { View, div, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { agents, terminals, panes, spaces, machines, focused, theme, run, hc, shared, setShared, notify, layout, props, window } from "herdr";
+import { agents, terminals, panes, spaces, machines, focused, theme, run, hc, exec, readTextFile, shared, setShared, notify, layout, props, window } from "herdr";
 import { adapterFor, adapterById, isSessionId } from "./adapters.js";
 import { MARK, hasFolders, placeSpaces } from "./folders.js";
 
@@ -45,17 +46,29 @@ const L = {
   prompt: `${LABEL}.prompt`,
   cwd: `${LABEL}.cwd`,
   waker: `${LABEL}.waker`,
+  shell: `${LABEL}.shell`,
 };
 const ALL_LABELS = Object.values(L);
 
 const CHECK_EVERY_MS = 30_000;
-const QUIT_WAIT_S = 15;
+// Quits can be slow (an agent's exit hooks): the quit's own wait.
+const QUIT_WAIT_S = 60;
 // A quit or a wake that hasn't shown its effect after this long failed.
 const STEP_TIMEOUT_MS = 2 * 60_000;
 // The shell's line is recorded only this soon after the quit: later, the
 // person may have typed something there, and a recorded draft would let a
 // wake run it.
 const PROMPT_WINDOW_MS = 10_000;
+// A recorded line is compared whole: a longer one isn't recorded.
+const PROMPT_MAX = 1000;
+// A run whose `hc` call never answers stops holding the lead after this long.
+const TICK_STUCK_MS = 5 * 60_000;
+// The leader rewrites its claim at most this often: every write re-renders
+// every mod of the app.
+const HEARTBEAT_MS = 5_000;
+// A terminal looked at outside the layout (a peek, a window) counts as shown
+// this long after it last had the keyboard there: those aren't listed anywhere.
+const LOOKED_MS = 10 * 60_000;
 const DELAYS = [5, 10, 20, 60, 0]; // minutes, 0 = off
 const DEFAULT_DELAY = 5;
 const SHELLS = new Set(["bash", "zsh", "fish", "sh", "dash", "ksh", "nu", "pwsh", "elvish", "xonsh"]);
@@ -230,7 +243,7 @@ async function lastLine(address) {
   const r = await hc(["read", address]); // visible screen only
   if (r.code !== 0) return null;
   const lines = r.stdout.split("\n").map((l) => l.trimEnd()).filter((l) => l.trim() !== "");
-  return (lines[lines.length - 1] ?? "").slice(0, 200);
+  return lines[lines.length - 1] ?? "";
 }
 
 const local = (address) => !String(address).includes("/");
@@ -249,6 +262,31 @@ const onShell = (t) => SHELLS.has(basename(t?.foreground?.name));
 // The agent runs as a child of a shell, which stays when it quits. An agent
 // that is the terminal's own program would end the terminal (and its tab).
 const underShell = (t) => SHELLS.has(basename(t?.argv?.[0])) && t?.foreground?.pid !== t?.pid;
+// Only the shell recorded at sleep time is read or typed into (any shell for
+// an agent put to sleep before it was recorded).
+const onItsShell = (t) => onShell(t) && (!t?.labels?.[L.shell] || String(t.foreground?.pid) === t.labels[L.shell]);
+// Herdr's own launcher: `bash -ic '"$@"; exec "$0" -i' bash claude`.
+const LAUNCHER = /^\s*"\$@"\s*(;\s*exec\s+"\$0"(\s+-[a-zA-Z]+)*\s*)?$/;
+
+// The shell the agent runs in, which stays when it quits: its parent, when
+// that is a shell with nothing queued after the agent. A `-c` script other
+// than Herdr's launcher (`claude; ./deploy.sh`) would run the rest at the
+// quit. Null when it can't be told. Commands typed on one line in an
+// interactive shell can't be seen.
+async function shellOf(pid, t) {
+  const r = await exec("ps", ["-o", "ppid=", "-p", String(pid)]).catch(() => null);
+  const ppid = Number(r?.stdout?.trim());
+  if (!(ppid > 0)) return null;
+  let argv = ppid === t.pid ? t.argv : null;
+  if (!argv) {
+    const raw = await readTextFile(`/proc/${ppid}/cmdline`).catch(() => null);
+    argv = raw ? raw.split("\0").filter(Boolean) : null;
+  }
+  if (!argv?.length || !SHELLS.has(basename(argv[0]))) return null;
+  const i = argv.findIndex((a, n) => n > 0 && /^-[a-zA-Z]*c[a-zA-Z]*$/.test(a));
+  if (i >= 0 && !LAUNCHER.test(String(argv[i + 1] ?? ""))) return null;
+  return ppid;
+}
 const setLabels = (address, pairs) => hc(["label", address, ...Object.entries(pairs).map(([k, v]) => `${k}=${v}`)]);
 const clearLabels = (address) => hc(["label", address, ...ALL_LABELS.map((k) => `${k}=`)]);
 
@@ -266,11 +304,21 @@ function layoutTerminals(node, out = new Set()) {
 
 // Terminals this window shows: the focused one, the agent an agent block
 // shows, every pane of the tab on screen, and terminal blocks of the layout.
+const looked = new Map(); // terminal → when it last had the keyboard outside the layout
 function shownHere() {
   const f = focused();
   const seen = new Set([f?.terminal, f?.shown, f?.agent].filter(Boolean));
   for (const p of panes()) if (p.tab === f?.tab && p.terminal) seen.add(p.terminal);
-  for (const t of layoutTerminals(layout())) seen.add(t);
+  const blocks = layoutTerminals(layout());
+  for (const t of blocks) seen.add(t);
+  // A peek or a window: kept as shown for a while after it loses the keyboard.
+  const now = Date.now();
+  if (f?.terminal && !f.pane && !blocks.has(f.terminal)) looked.set(f.terminal, now);
+  else if (f?.terminal && f.pane) looked.delete(f.terminal);
+  for (const [t, at] of looked) {
+    if (now - at < LOOKED_MS) seen.add(t);
+    else looked.delete(t);
+  }
   return seen;
 }
 
@@ -309,6 +357,10 @@ export default class AgentSleep extends View {
     this.focusBased = false; // a terminal was seen focused once
     this.focusGen = 0;
     this.toldQuiet = new Set(); // addresses whose quiet wake failure was toasted once
+    this.runGen = 0; // the tick under way; a stuck one is replaced after TICK_STUCK_MS
+    this.tickAt = 0;
+    this.quitWatch = new Set(); // seen quitting by this copy: the prompt window starts at the shell
+    this.preQuit = new Map(); // the agent's last screen line before its quit
     if (isDemo()) return;
     cx.timer.every(CHECK_EVERY_MS, (cx) => this.tick(cx));
     cx.timer.every(CHECK_EVERY_MS, (cx) => this.refreshRemote(cx));
@@ -333,7 +385,8 @@ export default class AgentSleep extends View {
       for (const [id, v] of Object.entries(all)) if (id !== this.id && now - (v?.at ?? 0) < LEADER_STALE_MS) next[id] = v;
       setShared(VISIBLE_KEY, next);
     }
-    if (periodic && shared(LEADER_KEY)?.id === this.id) setShared(LEADER_KEY, { id: this.id, at: now });
+    const stuck = this.running && now - this.tickAt >= TICK_STUCK_MS;
+    if (periodic && !stuck && shared(LEADER_KEY)?.id === this.id) setShared(LEADER_KEY, { id: this.id, at: now });
     if (cx) this.syncViewed(cx, terms, periodic);
   }
 
@@ -580,15 +633,15 @@ export default class AgentSleep extends View {
     // sleeping one, back on its shell, reports no status): a quitting agent
     // joins this list the moment it leaves that one ("falling asleep…"), and
     // a waking one leaves it the moment it's back there.
+    // An agent there that the labels' adapter doesn't recognise is awake too
+    // (settle() hands its session over).
     const awake = new Set(agents().map((a) => a.address));
+    // Another machine's rows are a snapshot: gone with the machine.
+    const ready = readyMachines();
     return [...this.labelled(), ...this.remote].filter((t) => {
       if (!isSessionId(t.labels[L.session]) || !adapterById(t.labels[L.agent])) return false;
-      // Another machine's row is a snapshot: once its agent runs, it's awake.
-      if (!local(t.address) && awake.has(t.address)) return false;
-      const state = t.labels[L.state];
-      if (state === "quitting") return !awake.has(t.address);
-      if (state === "waking" || this.wakingHere(t.address)) return !awake.has(t.address);
-      return true;
+      if (!local(t.address) && !ready.has(machineOf(t.address))) return false;
+      return !awake.has(t.address);
     });
   }
 
@@ -605,12 +658,14 @@ export default class AgentSleep extends View {
   heartbeat() {
     const l = shared(LEADER_KEY);
     if (l && l.id !== this.id) throw new LostLead();
-    setShared(LEADER_KEY, { id: this.id, at: Date.now() });
+    if (Date.now() - (l?.at ?? 0) >= HEARTBEAT_MS) setShared(LEADER_KEY, { id: this.id, at: Date.now() });
   }
 
   tick(cx) {
-    if (this.running || !this.lead()) return;
+    if ((this.running && Date.now() - this.tickAt < TICK_STUCK_MS) || !this.lead()) return;
     this.running = true;
+    this.tickAt = Date.now();
+    const gen = ++this.runGen;
     cx.spawn(async (cx) => {
       try {
         await this.settle(cx);
@@ -618,7 +673,7 @@ export default class AgentSleep extends View {
       } catch (e) {
         if (!(e instanceof LostLead)) console.log(`agent-sleep: ${e?.message ?? e}`);
       } finally {
-        this.running = false;
+        if (gen === this.runGen) this.running = false;
       }
       cx.notify();
     });
@@ -649,8 +704,13 @@ export default class AgentSleep extends View {
         const age = !at ? Infinity : state === "waking" ? this.wakeAge(s.address, at) : Date.now() - at;
 
         if (state === "quitting") {
-          if (onShell(t)) await this.finishSleep(cx, s.address, at);
-          else if (age > STEP_TIMEOUT_MS) {
+          if (onItsShell(t)) {
+            // Watched quitting here: the prompt window starts now, at the shell.
+            const from = this.quitWatch.delete(s.address) ? Date.now() : at;
+            await this.finishSleep(cx, s.address, at, from);
+          } else if (age <= STEP_TIMEOUT_MS) this.quitWatch.add(s.address);
+          else {
+            this.quitWatch.delete(s.address);
             // Still the agent: it never quit. Something else: it did, and the
             // person started another program; keep the session.
             if (adapter.isRunning(t)) {
@@ -676,11 +736,19 @@ export default class AgentSleep extends View {
           }
           if (running.id !== sessionId) this.replaced(s.address, adapter, sessionId); // a new conversation there
           await clearLabels(s.address); // woken, by click or by hand
+        } else if (!onShell(t) && agents().some((a) => a.address === s.address)) {
+          // An agent the labels' adapter doesn't recognise runs there: timed
+          // like one starting up, then its session is handed to the person.
+          if (!at) await setLabels(s.address, { [L.at]: Date.now() });
+          else if (age > STEP_TIMEOUT_MS) {
+            this.replaced(s.address, adapter, sessionId);
+            await clearLabels(s.address);
+          }
         } else if (state === "waking" && age > STEP_TIMEOUT_MS) {
           await setLabels(s.address, { [L.state]: "", [L.at]: "", [L.waker]: "" }); // resume failed: asleep again
         } else if (state !== "waking" && labels[L.at]) {
           await setLabels(s.address, { [L.at]: "" }); // was seen running, back on the shell
-        } else if (state !== "waking" && !labels[L.prompt] && onShell(t)) {
+        } else if (state !== "waking" && !labels[L.prompt] && onItsShell(t)) {
           // Not settled the first time: retry, but only shortly after the quit.
           await this.recordPrompt(cx, s.address, Number(labels[L.since] ?? 0));
         }
@@ -746,6 +814,8 @@ export default class AgentSleep extends View {
     const screen = await hc(["read", address]);
     if (screen.code !== 0 || adapter.hasDraft(screen.stdout)) return;
     if (await adapter.hasBackgroundWork(screen.stdout, pid)) return;
+    const shell = await shellOf(pid, t);
+    if (!shell) return;
     const last = await stillOk();
     if (!last || last.t.foreground?.pid !== pid) return;
 
@@ -759,10 +829,14 @@ export default class AgentSleep extends View {
       [L.at]: Date.now(),
       ...(title ? { [L.title]: title } : {}),
       [L.cwd]: last.t.foreground?.cwd ?? "", // empty removes an older one
+      [L.shell]: shell,
       // Herdr's "done": finished while nobody was looking. Keep that news.
       ...(last.a.status === "done" ? { [L.unseen]: "1" } : {}),
     });
     if (written.code !== 0) return; // no record of the session: don't quit
+    // The agent's last line: a "prompt" still showing it is the quit, not the shell.
+    const shown = screen.stdout.split("\n").map((l) => l.trimEnd()).filter((l) => l.trim() !== "");
+    this.preQuit.set(address, shown[shown.length - 1] ?? "");
     // `--if idle` refuses if the agent started working since the last check.
     // An agent Herdr marks "done" isn't "idle" to herdr-core, so the guard
     // only applies to idle ones; done ones rely on the checks above.
@@ -777,7 +851,7 @@ export default class AgentSleep extends View {
     for (let i = 0; i < QUIT_WAIT_S; i++) {
       await cx.sleep(1000);
       const { ok, t: now } = await getTerminal(address);
-      if (ok && onShell(now)) {
+      if (ok && onItsShell(now)) {
         await this.finishSleep(cx, address, Date.now());
         return;
       }
@@ -787,13 +861,15 @@ export default class AgentSleep extends View {
 
   // Nothing is typed here: the shell's line is the person's. The resume
   // command is in the row's tooltip and in `hc get` (labels).
-  async finishSleep(cx, address, quitAt) {
+  // `from`: when the prompt window starts (the shell seen in front, or the quit).
+  async finishSleep(cx, address, quitAt, from = quitAt) {
     await setLabels(address, { [L.state]: "", [L.at]: "", [L.since]: quitAt || Date.now() });
-    await this.recordPrompt(cx, address, quitAt);
+    await this.recordPrompt(cx, address, from);
   }
 
-  // The shell draws its prompt a moment after the agent quits: record the
-  // last line only once two reads half a second apart agree.
+  // The shell draws its prompt a moment after the agent quits (after its rc
+  // files): record the last line only once three reads half a second apart
+  // agree, and it isn't the agent's own last line from before the quit.
   // Only within PROMPT_WINDOW_MS of the quit, and never while the terminal is
   // on screen (the person could be typing there).
   async recordPrompt(cx, address, quitAt) {
@@ -801,19 +877,22 @@ export default class AgentSleep extends View {
     const fresh = async () => {
       if (!(quitAt > 0 && Date.now() - quitAt < PROMPT_WINDOW_MS) || visibleTerminals().has(address)) return false;
       const { ok, t } = await getTerminal(address);
-      return ok && !viewedElsewhere(t);
+      return ok && !viewedElsewhere(t) && onItsShell(t);
     };
     if (!(await fresh())) return;
-    let before = await lastLine(address);
-    for (let i = 0; i < 6; i++) {
+    const agentLine = this.preQuit.get(address);
+    let before = await lastLine(address), same = 0;
+    for (let i = 0; i < 10; i++) {
       await cx.sleep(500);
       const now = await lastLine(address);
       if (!(await fresh())) return;
-      if (now !== null && now === before) {
+      same = now !== null && now === before ? same + 1 : 0;
+      before = now;
+      if (same >= 2 && now !== agentLine && now.length <= PROMPT_MAX) {
+        this.preQuit.delete(address);
         await setLabels(address, { [L.prompt]: now });
         return;
       }
-      before = now;
     }
     // Never settled: no prompt recorded, so a wake points to the command instead.
   }
@@ -831,7 +910,13 @@ export default class AgentSleep extends View {
     // click on. Text typed there before the command is caught by the line
     // check right before typing (it falls back to the toast).
     this.waking.set(s.address, Date.now());
-    if (!quiet) run("pane.focus", { terminal: s.address });
+    if (!quiet) {
+      // The focus this moves is the click's: not a second, quiet wake.
+      this.focusSeen = s.address;
+      this.focusBased = true;
+      this.focusGen++;
+      run("pane.focus", { terminal: s.address });
+    }
     cx.notify();
     // Quiet: nothing when the person is using the terminal (its line changed,
     // a program in front, busy); a failure they can't see, once per terminal.
@@ -863,14 +948,20 @@ export default class AgentSleep extends View {
         if (t.labels?.[L.session] !== sessionId) return; // changed since the click: nothing to wake
         if (t.labels?.[L.state]) return; // already waking (a second click)
         const expected = t.labels?.[L.prompt];
-        if (!onShell(t)) return byHand(`${s.address} isn't on its shell.`, true);
+        if (!onItsShell(t)) return byHand(`${s.address} isn't on its shell.`, true);
         if (!expected) return byHand("Its shell line wasn't recorded.");
         if ((await setLabels(s.address, { [L.state]: "waking", [L.at]: Date.now(), [L.waker]: this.id })).code !== 0) {
           return byHand("Couldn't mark it as waking.");
         }
         // Another window may have clicked too: only the last writer types.
-        const again = await getTerminal(s.address);
-        if (!again.ok || again.t?.labels?.[L.waker] !== this.id) return;
+        // Read back after a moment, so both writes have landed.
+        const mine = async () => {
+          const r = await getTerminal(s.address);
+          const l = r.t?.labels ?? {};
+          return r.ok && l[L.waker] === this.id && l[L.state] === "waking" && l[L.session] === sessionId;
+        };
+        await cx.sleep(300);
+        if (!(await mine())) return;
         // Last look right before typing: the line must be exactly as it was.
         // On focus the person may be about to type there: look twice.
         let same = (await lastLine(s.address)) === expected;
@@ -882,6 +973,7 @@ export default class AgentSleep extends View {
           await setLabels(s.address, { [L.state]: "", [L.at]: "", [L.waker]: "" });
           return byHand("The shell's line has changed: clear it first.", true);
         }
+        if (!(await mine())) return;
         if ((await hc(["send", s.address, cmd])).code !== 0) {
           await setLabels(s.address, { [L.state]: "", [L.at]: "", [L.waker]: "" });
           return byHand("Typing the command failed.");
@@ -957,7 +1049,7 @@ export default class AgentSleep extends View {
     if (first || !now || shared(FOCUS_WAKE_KEY) !== true || !list.some((s) => s.address === now)) return;
     cx.spawn(async (cx) => {
       await cx.sleep(FOCUS_WAKE_MS);
-      if (gen !== this.focusGen || this.focusTarget() !== now || window()?.active === false) return;
+      if (gen !== this.focusGen || this.focusTarget() !== now || window()?.active === false || shared(FOCUS_WAKE_KEY) !== true) return;
       const s = this.sleeping().find((x) => x.address === now);
       if (s && !s.labels[L.state]) this.wake(s, cx, { quiet: true });
     });
@@ -1011,15 +1103,18 @@ export default class AgentSleep extends View {
   }
 
   cycleSort() {
+    if (isDemo()) return;
     const all = sorts();
     setShared(SORT_KEY, all[(all.indexOf(sortMode()) + 1) % all.length]);
   }
 
   toggleFocusWake() {
+    if (isDemo()) return;
     setShared(FOCUS_WAKE_KEY, shared(FOCUS_WAKE_KEY) !== true);
   }
 
   cycleDelay() {
+    if (isDemo()) return;
     setShared(DELAY_KEY, DELAYS[(DELAYS.indexOf(delay()) + 1) % DELAYS.length]);
   }
 

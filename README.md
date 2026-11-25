@@ -52,7 +52,9 @@ An agent is left awake when:
   (in `~/.claude/sessions/<pid>.json`) being anything but `idle`: it says
   `busy` while a background sub-agent runs and `shell` while background
   shells run.
-- it wasn't started from a shell (quitting would close its terminal);
+- it wasn't started from a shell (quitting would close its terminal), or
+  its shell was started with a command that runs more after it
+  (`bash -c 'claude; ./deploy.sh'`: quitting would run the rest);
 - it runs on another machine (`hc machine`): that machine's copy of the mod
   handles it (see below).
 
@@ -217,6 +219,13 @@ Grouping by folder:
   each row still shows its machine.
 
 Agents and shells:
+
+- Quitting an agent lets its shell go on: if you typed `claude; ./deploy.sh`
+  (or `claude && git push`) on one line, the rest runs when it falls asleep.
+  That can't be seen from outside; start agents on their own line, or pin
+  those.
+- An agent shown in a peek or a floating window counts as visible for 10
+  minutes after it last had the keyboard there.
 
 - Claude Code's prompt suggestions keep agents awake: see
   [above](#claude-code-turn-prompt-suggestions-off).
