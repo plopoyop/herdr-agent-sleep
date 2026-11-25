@@ -37,13 +37,19 @@ resumes it with its whole conversation.
   with status `done` or `idle`: skip it if it is visible (`focused()` terminal,
   shown and agent, every pane of `focused().tab`, every `content.terminal`
   block of the shown layout outside hidden nodes and inactive stack children,
+  a terminal that had the keyboard outside the layout (a peek, a window: no
+  `pane`) within the last 10 min, unless since focused in a pane,
   plus what other copies announced in shared `agent-sleep.visible`: each copy
   rewrites its own entry on change and every 15 s, entries older than 45 s
   are ignored, `close()` removes it), shown in another machine's app
   (`agent-sleep.viewed` within 105 s, either way: 15 s between writes plus
   90 s of clock difference), pinned, not idle for
   longer than the delay (`status_ms`), not a child of a shell (`argv[0]` is a
-  shell and `foreground.pid != pid`), not matched by an adapter, without a
+  shell and `foreground.pid != pid`), whose parent (`ps -o ppid=`) isn't a
+  shell with nothing queued after the agent (its argv: the terminal's own, or
+  `/proc/<ppid>/cmdline`; a `-c` script other than Herdr's launcher
+  `"$@"; exec "$0" -i` would run the rest at the quit, so is skipped; can't
+  read it → skipped), not matched by an adapter, without a
   well-formed session id, started less than the delay ago, with a draft in
   its prompt (text after `❯`, or on the lines below it up to the box border),
   or with background work (Claude's footer after the box border matches
@@ -59,18 +65,24 @@ resumes it with its whole conversation.
 - Then: write the labels with `agent-sleep.state=quitting`, type the quit
   command (`hc send --if idle` for an idle agent, so it is refused if the agent
   started working; a refused or failed send keeps `quitting`, and
-  settle() decides after 2 min), wait up to 15 s (`cx.sleep`) for a shell in the foreground, then
-  clear the state, set `agent-sleep.since`, and record the shell's last
-  non-empty line in `agent-sleep.prompt` once two reads 500 ms apart agree
-  (the prompt is drawn a moment after the quit), only within 10 s of the quit
+  settle() decides after 2 min), wait up to 60 s (`cx.sleep`; exit hooks can
+  be slow) for its shell in the foreground (the pid in `agent-sleep.shell`,
+  written with the other labels: no other shell is ever read or typed into),
+  then clear the state, set `agent-sleep.since`, and record the shell's last
+  non-empty line, whole, in `agent-sleep.prompt` once three reads 500 ms apart
+  agree, it isn't the agent's own last line from before the quit, and it is
+  at most 1000 characters (the prompt is drawn a moment after the quit, after
+  the shell's rc files), only within 10 s of the quit (of the shell coming up,
+  when this copy watched the quit)
   and only while the terminal isn't visible, here or in another machine's app
   (`agent-sleep.viewed`, read again before each read): later, the person may have typed
   there. Not recorded → a wake falls back to the toast. Nothing is typed into
   the shell. The label write is checked: if it fails, no quit is sent.
-- List: labelled terminals with a valid session and a known adapter; a
-  `quitting` or waking one only while it is not in `agents()`. In
-  `agents()` means awake (a sleeping agent, back on its shell, reports no
-  status), so each agent is in exactly one of the two lists.
+- List: labelled terminals with a valid session and a known adapter, not in
+  `agents()`, and for another machine's, only while that machine is ready.
+  In `agents()` means awake (a sleeping agent, back on its shell, reports no
+  status), whatever the labels say, so each agent is in exactly one of the
+  two lists.
 - Each check also settles labelled terminals: `quitting` and on its shell →
   finish as above; `quitting` with a missing or malformed `agent-sleep.at`
   (written with the state in one call, so tampered with) → timed out; `quitting` for over 2 min → drop the labels if the agent
@@ -78,7 +90,9 @@ resumes it with its whole conversation.
   running session is a different one; running but no session yet → note the time in
   `agent-sleep.at`, and after 2 min (a trust question) drop the labels, with
   the same toast unless it was waking; back on the shell after that → clear
-  `agent-sleep.at`; `waking` for
+  `agent-sleep.at`; another agent there, one the labels' adapter doesn't
+  recognise (in `agents()`, not on a shell) → timed the same way, then the
+  "replaced" toast and the labels dropped; `waking` for
   over 2 min with the agent not running → back to asleep; asleep with no
   recorded prompt → try again, still only within 10 s of the quit, and not
   while another machine's app shows it (fresh `agent-sleep.viewed`, read again
@@ -97,7 +111,8 @@ resumes it with its whole conversation.
   answering), the toast. If the session label still matches the row, no state is
   set (not already waking), a shell is in the foreground and a prompt line is
   recorded: write `state=waking` with `agent-sleep.waker=<copy id>`, re-read
-  it (another window may have clicked too: only the last writer types), read
+  it 300 ms later (another window may have clicked too: only the last writer
+  types; read again right before typing), read
   the shell's last line once more and, if it is still exactly
   `agent-sleep.prompt` (nothing typed there, including since the focus),
   type the resume command (UUID-checked) and clear `agent-sleep.unseen`. On a
@@ -239,11 +254,11 @@ resumes it with its whole conversation.
   `agent-sleep.title`, `agent-sleep.since`, `agent-sleep.unseen`,
   `agent-sleep.state` + `agent-sleep.at`, `agent-sleep.prompt`,
   `agent-sleep.waker`, `agent-sleep.cwd` (the agent's folder, written with the
-  others before the quit), `agent-sleep.viewed` (written by another machine's
-  copy showing it). `settle()`
+  others before the quit), `agent-sleep.shell` (the pid of the shell it ran
+  in), `agent-sleep.viewed` (written by another machine's copy showing it). `settle()`
   reads them fresh from `hc get`, never from the list it started from.
 - Block props `demo: true`: sample rows (`api`, `web`, `infra`, `docs`), no
-  timer, no actions. `preview.png` is a shot of it, so no real work shows.
+  timer, no actions (its chips change nothing). `preview.png` is a shot of it, so no real work shows.
 
 ## Watch out
 
@@ -257,10 +272,15 @@ resumes it with its whole conversation.
   pause, then pastes). Narrower than for a click, not closed. Never move
   focus from a quiet wake, and never wake from a peek or a window.
 - Several copies of the mod (one per layout) would act twice: one copy leads
-  (shared key `agent-sleep.leader`, refreshed every tick, taken over after
-  45 s of silence), and a busy set is claimed before any `await`.
+  (shared key `agent-sleep.leader`, refreshed at most every 5 s: each write
+  re-renders every mod; taken over after 45 s of silence), and a busy set is
+  claimed before any `await`. A run whose `hc` call never answers stops
+  holding the lead after 5 min, and a new run starts.
 - `cx.timer.every` counts from the end of its handler, but the handler only
   spawns: guard the run with a flag or runs overlap.
+- The quit runs what the agent's shell has queued after it: `claude;
+  ./deploy.sh` typed on one line in an interactive shell can't be seen, only
+  a `-c` script can (and is skipped).
 - Labels before the quit, never after: a quit that outlives the wait (or an
   app reload) must not lose the session id.
 - Session ids are typed into a shell: accept UUIDs only, everywhere.
@@ -268,8 +288,8 @@ resumes it with its whole conversation.
   recorded at sleep time: `hc send` pastes after whatever the person typed
   there, and presses Enter. A shell prompt that changes by itself (a clock)
   just falls back to the toast.
-- The leader refreshes its claim at every agent it handles, not only once per
-  tick: a long first run must not let another copy take over. And it never
+- The leader refreshes its claim at every agent it handles (every 5 s at
+  most), not only once per tick: a long first run must not let another copy take over. And it never
   takes the lead back: if another copy holds it, the run stops. `close()`
   releases the lead. `shared` persists: after a reload without `close()`,
   the next copy waits up to 45 s for the old entry to go stale.

@@ -29,6 +29,34 @@ command -v herdr-app >/dev/null || { echo "herdr-app not found in PATH" >&2; exi
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
 herdr-app status >/dev/null 2>&1 || { echo "Start the Herdr app first" >&2; exit 1; }
 
+# 0. The layout must have an Agents block (or the Sleeping one already),
+# checked before anything changes: Herdr's terminals and win98 have none.
+if [ -z "$layout" ]; then
+  layout="$(herdr-app status | python3 -c 'import json,sys; print(json.load(sys.stdin)["layout"])')"
+fi
+source_file="$app_home/layouts/$layout.json"
+for s in "${shipped[@]}"; do
+  if [ "$layout" = "$s" ] && [ -s "$app_home/layouts/$s-sleep.json" ]; then source_file="$app_home/layouts/$s-sleep.json"; fi
+done
+python3 - "$source_file" <<'EOF'
+import json, sys
+
+def has(node):
+    c = node.get("content", {})
+    if node.get("id") in ("agents", "agent-sleep") or c.get("mod") in ("agents", "agent-sleep"):
+        return True
+    return any(has(k) for k in node.get("children", []))
+
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        doc = json.load(f)
+except (OSError, ValueError) as e:
+    sys.exit(f"{path}: can't read it ({e})")
+if not has(doc):
+    sys.exit(f"{path}: no Agents block to put the list under. Pick a layout with one (Herdr's main has it), or add the block by hand (see the README).")
+EOF
+
 # 1. Check the new mod where Herdr doesn't load it, then swap it in. The
 # staging folder is hidden and on the same disk as mods/, so each move is a
 # plain rename: Herdr never sees a half-copied mod.
@@ -46,9 +74,6 @@ fi
 mv "$staging/agent-sleep" "$app_home/mods/agent-sleep"
 
 # 2. The layout.
-if [ -z "$layout" ]; then
-  layout="$(herdr-app status | python3 -c 'import json,sys; print(json.load(sys.stdin)["layout"])')"
-fi
 for s in "${shipped[@]}"; do
   if [ "$layout" = "$s" ]; then
     if [ ! -f "$app_home/layouts/$s-sleep.json" ]; then
@@ -68,7 +93,7 @@ mkdir -p "$backups"
 cp "$file" "$backups/$layout.json"
 
 python3 - "$file" "$fit" <<'EOF'
-import json, os, sys, tempfile
+import json, os, shutil, sys, tempfile
 
 path, fit = sys.argv[1], sys.argv[2] == "true"
 with open(path) as f:
@@ -114,6 +139,7 @@ fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".agent-sleep-", su
 with os.fdopen(fd, "w") as f:
     json.dump(doc, f, indent=2, ensure_ascii=False)
     f.write("\n")
+shutil.copymode(path, tmp)
 os.replace(tmp, path)
 EOF
 
