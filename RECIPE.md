@@ -11,8 +11,10 @@ resumes it with its whole conversation.
 - A block under the `agents` block of the sidebar, weight 0.5 next to its
   weight 1, background `chrome`, text 13 px.
 - Header, 30 px high, 16 px side padding, text 11 px medium `dim`:
-  "Sleeping", the count, and on the right two chips: the order ("by space",
-  "longest", "newest" or "by folder") and the delay ("after 5m", or "off").
+  "Sleeping", the count, and on the right three chips: the order ("by
+  space", "longest", "newest" or "by folder"), how agents wake ("wake on
+  click" in `dim`, or "wake on focus" in `foreground`) and the delay ("after
+  5m", or "off").
 - In "by folder", a 24 px header above each group, 8 px side padding, 11 px
   `dim`: a 10 px tile with 3 px corners in the folder's color (the
   space-folders avatar colors, `dim` without one), the folder's name in
@@ -166,6 +168,24 @@ resumes it with its whole conversation.
   spaces of listed rows are placed, rules compile once. Worktrees go by their
   own folder (space-folders nests them under their checkout's space, which
   needs git).
+- Click the wake chip: wake on focus on or off (shared key
+  `agent-sleep.wake-on-focus`, `true` for on; off by default).
+- Wake on focus: when the focused pane's own terminal (`focused().terminal`
+  with a `pane` and no `shown` replacement: not a peek, a window or a layout
+  terminal block, which are looking, not asking) changes to a sleeping
+  agent's (a row of the list, this machine or another) and is still the
+  focused one 1 s later, with the window active, the agent wakes as a click
+  on its row would, without moving focus. Right before typing, the shell's
+  line is read twice 300 ms apart and must still be the recorded one, with
+  the pane still focused. Passing through tabs (focus held under 1 s) wakes
+  nothing. The first terminal seen focused (app start, a reload, even when
+  focus comes back after a first render) never wakes: only a change does.
+  Seen on every render; a hidden copy doesn't render, so every 15 s a focus
+  render didn't see becomes the new starting point, never a wake. A row
+  already waking or falling asleep is left alone. Failures stay quiet when
+  the person is using the terminal (its line changed, a program in front,
+  busy); the others (no line recorded, a failed read, label or send) show
+  the "Wake it by hand" toast once per terminal per copy.
 - Click the delay chip: delay cycles 5 → 10 → 20 → 60 → off (shared key
   `agent-sleep.delay`, so every copy agrees).
 - Click "Sleeping": fold or unfold the list.
@@ -197,7 +217,7 @@ resumes it with its whole conversation.
   first, checks the mod in a staging folder, backs up the layout and the old
   mod, and writes the layout atomically.
 - `mods/agent-sleep/main.js`: the view and the engine. `herdr` functions:
-  `agents()`, `terminals()`, `panes()`, `spaces()`, `focused()`, `theme()`,
+  `agents()`, `terminals()`, `panes()`, `spaces()`, `focused()`, `window()`, `theme()`,
   `layout()`, `props()`, `run("pane.focus" | "layout.resize")`,
   `hc([...])` (`get --json`, `read` (screen only, no history), `send`, `label`),
   `shared` / `setShared`, `notify`, `nextCommand()`; `cx.sleep`, `cx.timer.every`.
@@ -231,6 +251,11 @@ resumes it with its whole conversation.
   rules: a change to space-folders' `folderOf` or `machineFolder` must be
   mirrored in `folders.js`, or the two lists disagree. A mod can't call
   another's code.
+- Wake on focus types into a shell the person just went to, maybe to use it:
+  the line is read twice right before `hc send`, but typing that starts after
+  the last read is pasted before the resume command (`hc send` waits for a
+  pause, then pastes). Narrower than for a click, not closed. Never move
+  focus from a quiet wake, and never wake from a peek or a window.
 - Several copies of the mod (one per layout) would act twice: one copy leads
   (shared key `agent-sleep.leader`, refreshed every tick, taken over after
   45 s of silence), and a busy set is claimed before any `await`.
@@ -274,6 +299,8 @@ resumes it with its whole conversation.
 - An idle Claude Code agent not on screen quits after the delay, shows in
   Sleeping with its title and a growing time; its shell line is untouched.
 - Clicking it resumes the same conversation and the row goes.
+- With wake on focus on, focusing a sleeping agent's pane for over a second
+  resumes it; `pane.focus` there and back within half a second doesn't.
 - An agent with text in its prompt, a visible agent, a pinned agent and an
   agent that is its terminal's own program stay awake.
 - Setting `agent-sleep=$(id)` on a terminal by hand doesn't list it, and
