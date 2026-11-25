@@ -31,6 +31,7 @@ import { View, div, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { agents, terminals, panes, spaces, machines, focused, theme, run, hc, shared, setShared, notify, layout, props } from "herdr";
 import { adapterFor, adapterById, isSessionId } from "./adapters.js";
+import { MARK, hasFolders, placeSpaces } from "./folders.js";
 
 const LABEL = "agent-sleep";
 const L = {
@@ -79,12 +80,14 @@ const REFRESH_STUCK_MS = 60_000;
 const WAKE_READ_TIMEOUT_MS = 30_000;
 const DELAY_KEY = "agent-sleep.delay";
 // Order of the Sleeping list, shared like the delay: by space (the order
-// Herdr keeps the terminals in), longest asleep first, or newest first.
+// Herdr keeps the terminals in), longest asleep first, newest first, or under
+// the folders of the space-folders mod (offered only when it has some).
 const SORT_KEY = "agent-sleep.sort";
-const SORTS = ["space", "longest", "newest"];
-const SORT_LABEL = { space: "by space", longest: "longest", newest: "newest" };
+const SORTS = ["space", "longest", "newest", "folder"];
+const SORT_LABEL = { space: "by space", longest: "longest", newest: "newest", folder: "by folder" };
 const SORT_TIP = {
   space: "Sorted by space (click to change)",
+  folder: "Grouped by space folder (click to change)",
   longest: "Longest asleep first (click to change)",
   newest: "Newest asleep first (click to change)",
 };
@@ -98,6 +101,7 @@ const AGENTS_MAX = 520;
 const SELF_MAX = 320;
 const ROW = 30;
 const SUB_ROW = 26;
+const GROUP_ROW = 24;
 
 // `match`: a node id, or a predicate.
 function findNode(node, match) {
@@ -150,14 +154,45 @@ const delay = () => {
   return DELAYS.includes(d) ? d : DEFAULT_DELAY;
 };
 
+const sorts = () => (hasFolders() ? SORTS : SORTS.filter((s) => s !== "folder"));
 const sortMode = () => {
+  if (isDemo()) return "space";
   const s = shared(SORT_KEY);
-  return SORTS.includes(s) ? s : "space";
+  return sorts().includes(s) ? s : "space";
 };
+
+// The space a row's terminal belongs to. Labels hold ids local to the
+// terminal's machine; the app prefixes remote ones.
+function spaceOf(s, sp = spaces()) {
+  const machine = machineOf(s.address);
+  const tabId = s.labels?.["herdr.tab"];
+  const tabKey = machine && tabId ? `${machine}/${tabId}` : tabId;
+  const index = sp.findIndex((w) => w.tabs.some((x) => x.id === tabKey));
+  const space = sp[index];
+  return { space, index, tab: space?.tabs.find((x) => x.id === tabKey) };
+}
+
+// Rows under their space folder, in the order the spaces list draws the
+// folders, then those in none. Inside a group, Herdr's space order (rows
+// without a space last). Each row carries its space for row().
+function folderGroups(list) {
+  const sp = spaces();
+  const rows = list.map((s) => ({ s, at: spaceOf(s, sp) }));
+  const { placed, order } = placeSpaces(sp, panes(), new Set(rows.map((r) => r.at.space?.id).filter(Boolean)));
+  const byKey = new Map();
+  for (const r of rows) {
+    const p = placed[r.at.space?.id] ?? { key: "", machine: null, folder: null };
+    if (!byKey.has(p.key)) byKey.set(p.key, { ...p, rows: [] });
+    byKey.get(p.key).rows.push(r);
+  }
+  const rank = (r) => (r.at.index < 0 ? Infinity : r.at.index);
+  for (const g of byKey.values()) g.rows.sort((a, b) => rank(a) - rank(b));
+  return [...order, ""].filter((k) => byKey.has(k)).map((k) => byKey.get(k));
+}
 
 // Rows without a sleep time yet (falling asleep) count as asleep since now.
 function sortRows(list, mode, now) {
-  if (mode === "space") return list;
+  if (mode === "space" || mode === "folder") return list;
   const since = (s) => Number(s.labels[L.since]) || now;
   const dir = mode === "longest" ? 1 : -1;
   return [...list].sort((a, b) => dir * (since(a) - since(b)));
@@ -887,7 +922,7 @@ export default class AgentSleep extends View {
     });
   }
 
-  fit(count) {
+  fit(count, extra = 0) {
     if (props()?.fit !== true) return;
     const root = layout();
     const agentsNode = findNode(root, (n) => n.id === AGENTS_BLOCK || n.content?.mod === "agents");
@@ -895,7 +930,7 @@ export default class AgentSleep extends View {
     if (!agentsNode?.id || !selfNode?.id) return;
     const want = [
       [agentsNode, Math.min(agentsHeight(), AGENTS_MAX)],
-      [selfNode, Math.min(ROW + Math.max(count, 1) * ROW + 12, SELF_MAX)],
+      [selfNode, Math.min(ROW + Math.max(count, 1) * ROW + extra + 12, SELF_MAX)],
     ];
     // Each size is asked for once: a resize re-renders every mod.
     this.fitted ??= {};
@@ -907,21 +942,18 @@ export default class AgentSleep extends View {
   }
 
   cycleSort() {
-    setShared(SORT_KEY, SORTS[(SORTS.indexOf(sortMode()) + 1) % SORTS.length]);
+    const all = sorts();
+    setShared(SORT_KEY, all[(all.indexOf(sortMode()) + 1) % all.length]);
   }
 
   cycleDelay() {
     setShared(DELAY_KEY, DELAYS[(DELAYS.indexOf(delay()) + 1) % DELAYS.length]);
   }
 
-  row(t, s, now) {
+  row(t, s, now, at = spaceOf(s)) {
     const adapter = adapterById(s.labels[L.agent]);
-    // Labels hold ids local to the terminal's machine; the app prefixes remote ones.
     const machine = machineOf(s.address);
-    const tabId = s.labels?.["herdr.tab"];
-    const tabKey = machine && tabId ? `${machine}/${tabId}` : tabId;
-    const space = spaces().find((sp) => sp.tabs.some((x) => x.id === tabKey));
-    const tab = space?.tabs.find((x) => x.id === tabKey);
+    const { space, tab } = at;
     const title = s.labels[L.title] || tab?.name || s.address;
     const since = Number(s.labels[L.since]);
     const unseen = s.labels[L.unseen] === "1";
@@ -952,15 +984,35 @@ export default class AgentSleep extends View {
         : div().flex_none().text_size(10.5).font_semibold().text_color(t.dim).child("z"));
   }
 
+  // A folder's header in "by folder": its tile and name, the machine whose
+  // folder it is, and how many of its agents sleep. "No folder" for the rest.
+  groupHead(t, g) {
+    const f = g.folder;
+    return h_flex()
+      .id(`sleep-group-${g.key || "none"}`)
+      .px(8)
+      .h(GROUP_ROW)
+      .flex_none()
+      .gap(7)
+      .items_center()
+      .text_size(11)
+      .text_color(t.dim)
+      .child(div().size(10).flex_none().rounded(3).bg(f ? (f.color ? MARK[f.color] ?? f.color : t.dim) : t.border))
+      .child(div().flex_1().min_w(0).truncate().text_color(f ? t.muted : t.dim).child(f?.name ?? "No folder"))
+      .when(Boolean(f && g.machine), (el) => el.child(div().flex_none().text_size(10).child(g.machine)))
+      .child(div().flex_none().child(String(g.rows.length)));
+  }
+
   render(cx) {
     const t = theme();
     const now = Date.now();
     const sort = sortMode();
     const list = sortRows(this.sleeping(), sort, now);
+    const groups = sort === "folder" ? folderGroups(list) : null;
     if (!isDemo()) {
       this.presence(false, cx);
       this.markSeen(list, cx);
-      this.fit(list.length);
+      this.fit(list.length, groups ? groups.length * GROUP_ROW : 0);
     }
     const d = delay();
     return v_flex()
@@ -997,7 +1049,9 @@ export default class AgentSleep extends View {
       )
       .when(!this.folded, (el) => el.child(
         v_flex().id("sleep-list").flex_1().min_h(0).px(8).overflow_y_scrollbar()
-          .children(list.map((s) => this.row(t, s, now)))
+          .children(groups
+            ? groups.flatMap((g) => [this.groupHead(t, g), ...g.rows.map((r) => this.row(t, r.s, now, r.at))])
+            : list.map((s) => this.row(t, s, now)))
           .when(list.length === 0, (el) => el.child(div().px(8).text_size(12).text_color(t.dim)
             .child(d > 0 ? `Idle agents sleep after ${d} min.` : "Sleep is off."))),
       ));

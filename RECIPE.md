@@ -12,7 +12,12 @@ resumes it with its whole conversation.
   weight 1, background `chrome`, text 13 px.
 - Header, 30 px high, 16 px side padding, text 11 px medium `dim`:
   "Sleeping", the count, and on the right two chips: the order ("by space",
-  "longest" or "newest") and the delay ("after 5m", or "off").
+  "longest", "newest" or "by folder") and the delay ("after 5m", or "off").
+- In "by folder", a 24 px header above each group, 8 px side padding, 11 px
+  `dim`: a 10 px tile with 3 px corners in the folder's color (the
+  space-folders avatar colors, `dim` without one), the folder's name in
+  `muted`, the machine whose folder it is (another machine's) in 10 px, and
+  the group's count. The last group, "No folder", has a `border` tile.
 - One row per sleeping agent, 30 px high, radius 8, hover `hover`: the
   agent's icon (`icons/claude.svg`, `icons/codex.svg`) at 45 % opacity, the
   space name in `muted` (max 120 px), "· title" in `dim`, for an agent of
@@ -139,9 +144,28 @@ resumes it with its whole conversation.
   machine's read was already under way).
 - Click the order chip: by space (Herdr's terminal order, this machine's
   agents first, then other machines') → longest asleep
-  first → newest asleep first (shared key `agent-sleep.sort`, so every copy
-  agrees). A row falling asleep, with no sleep time yet, counts as asleep
-  since now.
+  first → newest asleep first → by folder (shared key `agent-sleep.sort`, so
+  every copy agrees). A row falling asleep, with no sleep time yet, counts as
+  asleep since now. "by folder" is offered only while the shown layout runs
+  the space-folders mod and it has folders (shared `space-folders`, which
+  outlives the mod in `shared.json`); otherwise, and in demo, a stored
+  "folder" reads as by space.
+- By folder: each row goes under the folder of the space-folders mod its
+  space shows in, read from shared `space-folders` (`{ list, of }` per
+  machine, `""` for this computer): the folder it was dragged in (`of`, by the
+  id that machine knows the space by; `""` = none), else the folder whose
+  rules ("Collect spaces from", comma-separated) reach deepest into the folder
+  the space's first terminal works in (else where it was made). A space of
+  another machine in none of that machine's folders goes in the first folder
+  on this computer whose rules match the machine's name or the folder one of
+  its spaces works in. Groups follow the spaces list top to bottom: this
+  computer's folders, each followed by the folders of the machines it takes
+  in, then the folders of the other machines (names in `.sort()` order), then
+  "No folder", which holds every machine's loose spaces (rows carry their
+  machine's name). Inside a group, Herdr's space order (`spaces()`). Only the
+  spaces of listed rows are placed, rules compile once. Worktrees go by their
+  own folder (space-folders nests them under their checkout's space, which
+  needs git).
 - Click the delay chip: delay cycles 5 → 10 → 20 → 60 → off (shared key
   `agent-sleep.delay`, so every copy agrees).
 - Click "Sleeping": fold or unfold the list.
@@ -177,6 +201,10 @@ resumes it with its whole conversation.
   `layout()`, `props()`, `run("pane.focus" | "layout.resize")`,
   `hc([...])` (`get --json`, `read` (screen only, no history), `send`, `label`),
   `shared` / `setShared`, `notify`, `nextCommand()`; `cx.sleep`, `cx.timer.every`.
+- `mods/agent-sleep/folders.js`: the space-folders mod's placement rules
+  (its `rule`, `folderOf` and `machineFolder`), mirrored: `placeSpaces`,
+  `folderOrder`, `hasFolders`. Reads shared `space-folders` and `panes()`;
+  never writes.
 - `mods/agent-sleep/adapters.js`: one adapter per agent, plus `isSessionId`:
   - Claude Code: `app == "claude-code"`, foreground `claude`; session from
     `~/.claude/sessions/<pid>.json` (`sessionId`, `startedAt`); draft = text
@@ -199,6 +227,10 @@ resumes it with its whole conversation.
 
 ## Watch out
 
+- "by folder" reads another mod's shared state and copies its placement
+  rules: a change to space-folders' `folderOf` or `machineFolder` must be
+  mirrored in `folders.js`, or the two lists disagree. A mod can't call
+  another's code.
 - Several copies of the mod (one per layout) would act twice: one copy leads
   (shared key `agent-sleep.leader`, refreshed every tick, taken over after
   45 s of silence), and a busy set is claimed before any `await`.
@@ -236,6 +268,9 @@ resumes it with its whole conversation.
 ## Done when
 
 - `herdr-app check mods/agent-sleep` passes.
+- With space-folders and a folder holding a space with a sleeping agent,
+  "by folder" shows that agent under the folder's header; without folders the
+  chip never offers "by folder".
 - An idle Claude Code agent not on screen quits after the delay, shows in
   Sleeping with its title and a growing time; its shell line is untouched.
 - Clicking it resumes the same conversation and the row goes.
