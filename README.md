@@ -28,7 +28,10 @@ what is needed to resume them.
   goes to Spaces.
 - Click **after 5m** in the list header to change the delay: 5, 10, 20, 60 min, or off.
 - Click **by space** in the list header to change the order: by space,
-  longest asleep first, or newest asleep first.
+  longest asleep first, or newest asleep first. With the
+  [space-folders](https://github.com/jankeesvw/herdr-space-folders) mod and
+  some folders, **by folder** groups the sleeping agents under the folder
+  their space is in, in the same order as the spaces list.
 
 An agent is left awake when:
 
@@ -194,6 +197,15 @@ Other windows and clients:
   client, `hc send` from a script or another agent) in the first 10 seconds
   after it quit can be recorded as the shell's prompt; a wake would then run
   it with the resume command.
+
+Grouping by folder:
+
+- **by folder** follows space-folders' rules as of its current version (a
+  copy of them, since a mod can't call another's code). A worktree space is
+  placed by its own folder, where space-folders puts it under its checkout's
+  space.
+- Spaces in no folder all go under **No folder**, whatever their machine;
+  each row still shows its machine.
 
 Agents and shells:
 
