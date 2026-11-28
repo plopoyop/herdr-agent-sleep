@@ -37,7 +37,10 @@ what is needed to resume them.
   longest asleep first, or newest asleep first. With the
   [space-folders](https://github.com/jankeesvw/herdr-space-folders) mod and
   some folders, **by folder** groups the sleeping agents under the folder
-  their space is in, in the same order as the spaces list.
+  their space is in, in the same order as the spaces list. Click a folder's
+  header to fold it away (a dot still shows when one of its agents finished
+  while you weren't looking); this is separate from folding it in the spaces
+  list.
 
 An agent is left awake when:
 
@@ -138,7 +141,7 @@ shows sample rows and does nothing (used for `preview.png`).
 Quit the Herdr app first: your terminals keep running (herdr-core), and no
 copy of the mod runs while its settings are removed. The script removes the
 labels it left on terminals (finished ones included), its block from every
-layout, its shared settings (delay, order, wake on focus) and the mod. Agents asleep at that moment
+layout, its shared settings (delay, order, wake on focus, folded folders) and the mod. Agents asleep at that moment
 stay on their shell: their resume commands, with the folder to run them in,
 are printed and saved in
 `~/.config/herdr-app/.agent-sleep-backup/<date>/sleeping.txt` before any

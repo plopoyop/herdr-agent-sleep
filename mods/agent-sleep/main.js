@@ -28,7 +28,7 @@
 // still exactly what it was when the agent fell asleep: text the person typed
 // there is never run along with the resume command.
 
-import { View, div, image } from "gpui-kit";
+import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { agents, terminals, panes, spaces, machines, focused, theme, run, hc, exec, readTextFile, shared, setShared, notify, layout, props, window } from "herdr";
 import { adapterFor, adapterById, isSessionId } from "./adapters.js";
@@ -104,6 +104,10 @@ const FOCUS_SETTLE_MS = 300;
 // Herdr keeps the terminals in), longest asleep first, newest first, or under
 // the folders of the space-folders mod (offered only when it has some).
 const SORT_KEY = "agent-sleep.sort";
+// Folders folded in "by folder": group key ("" is no folder) → true. Shared
+// like the order; independent of how the spaces list folds them.
+const FOLDED_KEY = "agent-sleep.folded";
+const groupKey = (g) => g.key || "none";
 const SORTS = ["space", "longest", "newest", "folder"];
 const SORT_LABEL = { space: "by space", longest: "longest", newest: "newest", folder: "by folder" };
 const SORT_TIP = {
@@ -1091,7 +1095,8 @@ export default class AgentSleep extends View {
     if (!agentsNode?.id || !selfNode?.id) return;
     const want = [
       [agentsNode, Math.min(agentsHeight(), AGENTS_MAX)],
-      [selfNode, Math.min(ROW + Math.max(count, 1) * ROW + extra + 12, SELF_MAX)],
+      // One row for the empty list's line; none under folded groups only.
+      [selfNode, Math.min(ROW + Math.max(count, extra ? 0 : 1) * ROW + extra + 12, SELF_MAX)],
     ];
     // Each size is asked for once: a resize re-renders every mod.
     this.fitted ??= {};
@@ -1152,23 +1157,43 @@ export default class AgentSleep extends View {
         : div().flex_none().text_size(10.5).font_semibold().text_color(t.dim).child("z"));
   }
 
+  toggleGroup(key) {
+    if (isDemo()) return;
+    const folded = { ...(shared(FOLDED_KEY) ?? {}) };
+    // Folders deleted from this computer's list go (ids are never reused);
+    // other machines' stay, as one may only be offline.
+    const local = new Set((shared("space-folders")?.[""]?.list ?? []).map((f) => `:${f.id}`));
+    for (const k of Object.keys(folded)) if (k.startsWith(":") && !local.has(k)) delete folded[k];
+    if (folded[key]) delete folded[key];
+    else folded[key] = true;
+    setShared(FOLDED_KEY, Object.keys(folded).length ? folded : null);
+  }
+
   // A folder's header in "by folder": its tile and name, the machine whose
   // folder it is, and how many of its agents sleep. "No folder" for the rest.
-  groupHead(t, g) {
+  // A click folds it; folded, it still shows when one of them finished unseen.
+  groupHead(t, g, folded) {
     const f = g.folder;
+    const unseen = folded && g.rows.some((r) => r.s.labels[L.unseen] === "1");
     return h_flex()
-      .id(`sleep-group-${g.key || "none"}`)
+      .id(`sleep-group-${groupKey(g)}`)
       .px(8)
       .h(GROUP_ROW)
       .flex_none()
       .gap(7)
       .items_center()
+      .rounded(6)
       .text_size(11)
       .text_color(t.dim)
+      .cursor_pointer()
+      .hover((el) => el.bg(t.hover))
+      .on_click(() => this.toggleGroup(groupKey(g)))
       .child(div().size(10).flex_none().rounded(3).bg(f ? (f.color ? MARK[f.color] ?? f.color : t.dim) : t.border))
       .child(div().flex_1().min_w(0).truncate().text_color(f ? t.muted : t.dim).child(f?.name ?? "No folder"))
       .when(Boolean(f && g.machine), (el) => el.child(div().flex_none().text_size(10).child(g.machine)))
-      .child(div().flex_none().child(String(g.rows.length)));
+      .when(unseen, (el) => el.child(div().size(7).flex_none().rounded(4).bg(t.done)))
+      .child(div().flex_none().child(String(g.rows.length)))
+      .child(svg(`mods/workspace-chrome/chevron-${folded ? "right" : "down"}.svg`).size(10).flex_none().text_color(t.dim));
   }
 
   render(cx) {
@@ -1177,11 +1202,13 @@ export default class AgentSleep extends View {
     const sort = sortMode();
     const list = sortRows(this.sleeping(), sort, now);
     const groups = sort === "folder" ? folderGroups(list) : null;
+    const folded = isDemo() ? {} : shared(FOLDED_KEY) ?? {};
+    const shownRows = groups ? groups.reduce((n, g) => n + (folded[groupKey(g)] ? 0 : g.rows.length), 0) : list.length;
     if (!isDemo()) {
       this.presence(false, cx);
       this.markSeen(list, cx);
       this.wakeOnFocus(list, cx);
-      this.fit(list.length, groups ? groups.length * GROUP_ROW : 0);
+      this.fit(shownRows, groups ? groups.length * GROUP_ROW : 0);
     }
     const d = delay();
     return v_flex()
@@ -1227,7 +1254,10 @@ export default class AgentSleep extends View {
       .when(!this.folded, (el) => el.child(
         v_flex().id("sleep-list").flex_1().min_h(0).px(8).overflow_y_scrollbar()
           .children(groups
-            ? groups.flatMap((g) => [this.groupHead(t, g), ...g.rows.map((r) => this.row(t, r.s, now, r.at))])
+            ? groups.flatMap((g) => {
+              const shut = Boolean(folded[groupKey(g)]);
+              return [this.groupHead(t, g, shut), ...(shut ? [] : g.rows.map((r) => this.row(t, r.s, now, r.at)))];
+            })
             : list.map((s) => this.row(t, s, now)))
           .when(list.length === 0, (el) => el.child(div().px(8).text_size(12).text_color(t.dim)
             .child(d > 0 ? `Idle agents sleep after ${d} min.` : "Sleep is off."))),
