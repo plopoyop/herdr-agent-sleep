@@ -104,7 +104,7 @@ const FOCUS_SETTLE_MS = 300;
 // Herdr keeps the terminals in), longest asleep first, newest first, or under
 // the folders of the space-folders mod (offered only when it has some).
 const SORT_KEY = "agent-sleep.sort";
-// Folders folded in "by folder": group key ("" is no folder) → true. Shared
+// Folders folded in "by folder": group key ("none" is no folder) → true. Shared
 // like the order; independent of how the spaces list folds them.
 const FOLDED_KEY = "agent-sleep.folded";
 const groupKey = (g) => g.key || "none";
@@ -1162,8 +1162,12 @@ export default class AgentSleep extends View {
     const folded = { ...(shared(FOLDED_KEY) ?? {}) };
     // Folders deleted from this computer's list go (ids are never reused);
     // other machines' stay, as one may only be offline.
-    const local = new Set((shared("space-folders")?.[""]?.list ?? []).map((f) => `:${f.id}`));
-    for (const k of Object.keys(folded)) if (k.startsWith(":") && !local.has(k)) delete folded[k];
+    // Only against a list that is there: a missing one isn't an empty one.
+    const mine = shared("space-folders")?.[""]?.list;
+    if (Array.isArray(mine)) {
+      const local = new Set(mine.map((f) => `:${f.id}`));
+      for (const k of Object.keys(folded)) if (k.startsWith(":") && !local.has(k)) delete folded[k];
+    }
     if (folded[key]) delete folded[key];
     else folded[key] = true;
     setShared(FOLDED_KEY, Object.keys(folded).length ? folded : null);

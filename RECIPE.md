@@ -172,13 +172,16 @@ resumes it with its whole conversation.
   outlives the mod in `shared.json`); otherwise, and in demo, a stored
   "folder" reads as by space.
 - Click a group's header: fold or unfold it (shared key `agent-sleep.folded`,
-  `{ <group key>: true }`, the key being `<machine>:<folder id>`, `""` for
-  this computer, or `none` for "No folder"; every copy agrees). Independent
+  `{ <group key>: true }`, the key being `<machine>:<folder id>`,
+  `:<folder id>` for this computer's folders, or `none` for "No folder";
+  every copy agrees). Independent
   of how the spaces list folds that folder. Nothing in demo. Folded rows
   don't count in `fit`'s height. Wake on focus and the unseen marks work the
   same for a folded group's agents. A fold is kept while the group is empty:
   an agent falling asleep in it later shows only in the count. Folding drops
-  the keys of this computer's folders that no longer exist. With every group
+  the keys of this computer's folders that no longer exist, only when this
+  computer's list is in shared `space-folders` (a missing list isn't an
+  empty one). With every group
   folded, `fit` keeps no empty row.
 - By folder: each row goes under the folder of the space-folders mod its
   space shows in, read from shared `space-folders` (`{ list, of }` per
@@ -257,8 +260,11 @@ resumes it with its whole conversation.
   `ansi5 #8b7cf6`, `ansi2 #3fae6a`, `ansi1 #d9649a`), `hasFolders`,
   `placeSpaces`. Reads shared `space-folders`, `layout()` and `panes()`;
   never writes.
-- Icons: `icons/claude.svg` and `icons/codex.svg` are Herdr's own, in its home
-  folder; the mod ships none.
+- Icons: `icons/claude.svg`, `icons/codex.svg` and the folder chevrons
+  (`mods/workspace-chrome/chevron-down.svg`, `chevron-right.svg`) are Herdr's
+  own, in its home folder; the mod ships none.
+- `main.js` also reads shared `space-folders` itself (this computer's
+  `list[].id`) to drop folds of deleted folders.
 - `mods/agent-sleep/adapters.js`: one adapter per agent, plus `isSessionId`
   (`herdr`: `exec`, `readTextFile`, `home()`; programs: `pgrep -l -P <pid>`,
   `ls -l /proc/<pid>/fd`):
@@ -285,7 +291,8 @@ resumes it with its whole conversation.
 
 - "by folder" reads another mod's shared state and copies its placement
   rules: a change to space-folders' `folderOf` or `machineFolder` must be
-  mirrored in `folders.js`, or the two lists disagree. A mod can't call
+  mirrored in `folders.js`, or the two lists disagree; the fold cleanup in
+  `main.js` relies on its `{ list: [{ id }] }` shape too. A mod can't call
   another's code.
 - Wake on focus types into a shell the person just went to, maybe to use it:
   the line is read twice right before `hc send`, but typing that starts after
