@@ -18,8 +18,12 @@ resumes it with its whole conversation.
 - In "by folder", a 24 px header above each group, 8 px side padding, 11 px
   `dim`: a 10 px tile with 3 px corners in the folder's color (the
   space-folders avatar colors, `dim` without one), the folder's name in
-  `muted`, the machine whose folder it is (another machine's) in 10 px, and
-  the group's count. The last group, "No folder", has a `border` tile.
+  `muted`, the machine whose folder it is (another machine's) in 10 px, a
+  7 px `done` dot while folded with an agent in it that finished unseen, the
+  group's count, and a 10 px chevron in `dim` (Herdr's
+  `mods/workspace-chrome/chevron-down.svg`, `chevron-right.svg` folded);
+  radius 6, hover `hover`. The last group, "No folder", has a `border` tile.
+  A folded group shows its header only.
 - One row per sleeping agent, 30 px high, radius 8, hover `hover`: the
   agent's icon (`icons/claude.svg`, `icons/codex.svg`) at 45 % opacity, the
   space name in `muted` (max 120 px), "· title" in `dim`, for an agent of
@@ -167,6 +171,18 @@ resumes it with its whole conversation.
   the space-folders mod and it has folders (shared `space-folders`, which
   outlives the mod in `shared.json`); otherwise, and in demo, a stored
   "folder" reads as by space.
+- Click a group's header: fold or unfold it (shared key `agent-sleep.folded`,
+  `{ <group key>: true }`, the key being `<machine>:<folder id>`,
+  `:<folder id>` for this computer's folders, or `none` for "No folder";
+  every copy agrees). Independent
+  of how the spaces list folds that folder. Nothing in demo. Folded rows
+  don't count in `fit`'s height. Wake on focus and the unseen marks work the
+  same for a folded group's agents. A fold is kept while the group is empty:
+  an agent falling asleep in it later shows only in the count. Folding drops
+  the keys of this computer's folders that no longer exist, only when this
+  computer's list is in shared `space-folders` (a missing list isn't an
+  empty one). With every group
+  folded, `fit` keeps no empty row.
 - By folder: each row goes under the folder of the space-folders mod its
   space shows in, read from shared `space-folders` (`{ list, of }` per
   machine, `""` for this computer): the folder it was dragged in (`of`, by the
@@ -244,8 +260,11 @@ resumes it with its whole conversation.
   `ansi5 #8b7cf6`, `ansi2 #3fae6a`, `ansi1 #d9649a`), `hasFolders`,
   `placeSpaces`. Reads shared `space-folders`, `layout()` and `panes()`;
   never writes.
-- Icons: `icons/claude.svg` and `icons/codex.svg` are Herdr's own, in its home
-  folder; the mod ships none.
+- Icons: `icons/claude.svg`, `icons/codex.svg` and the folder chevrons
+  (`mods/workspace-chrome/chevron-down.svg`, `chevron-right.svg`) are Herdr's
+  own, in its home folder; the mod ships none.
+- `main.js` also reads shared `space-folders` itself (this computer's
+  `list[].id`) to drop folds of deleted folders.
 - `mods/agent-sleep/adapters.js`: one adapter per agent, plus `isSessionId`
   (`herdr`: `exec`, `readTextFile`, `home()`; programs: `pgrep -l -P <pid>`,
   `ls -l /proc/<pid>/fd`):
@@ -272,7 +291,8 @@ resumes it with its whole conversation.
 
 - "by folder" reads another mod's shared state and copies its placement
   rules: a change to space-folders' `folderOf` or `machineFolder` must be
-  mirrored in `folders.js`, or the two lists disagree. A mod can't call
+  mirrored in `folders.js`, or the two lists disagree; the fold cleanup in
+  `main.js` relies on its `{ list: [{ id }] }` shape too. A mod can't call
   another's code.
 - Wake on focus types into a shell the person just went to, maybe to use it:
   the line is read twice right before `hc send`, but typing that starts after
@@ -324,6 +344,8 @@ resumes it with its whole conversation.
 - With space-folders and a folder holding a space with a sleeping agent,
   "by folder" shows that agent under the folder's header; without folders the
   chip never offers "by folder".
+- Clicking a folder's header hides its agents and leaves the header with its
+  count; clicking again shows them; another window folds it too.
 - An idle Claude Code agent not on screen quits after the delay, shows in
   Sleeping with its title and a growing time; its shell line is untouched.
 - Clicking it resumes the same conversation and the row goes.
